@@ -5,7 +5,7 @@ from google.genai import types # For HarmCategory, HarmBlockThreshold, Generatio
 import os
 import json
 import traceback
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple, Any
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 
@@ -479,14 +479,14 @@ DANGEROUS_CONTENT:BLOCK_NONE""",
         }
         safety_settings = self.parsed_safety_settings
 
-        for attempt in range(max_attempts + 1):
+        for attempt in range(self.retry_attempts + 1):
             try:
                 # Apply delay *before* the call
                 # _respect_delay is synchronous, so it's fine to call directly here
                 # as it will block this specific async task, not the whole event loop.
                 self._respect_delay()
 
-                self.logger.info(f"Translating text ({index + 1}): \"{text_to_translate[:50]}...\" (Attempt {attempt+1}/{max_attempts+1})")
+                self.logger.info(f"Translating text ({index + 1}): \"{text_to_translate[:50]}...\" (Attempt {attempt+1}/{self.retry_attempts+1})")
                 
                 loop = asyncio.get_event_loop()
                 # Run the synchronous _make_api_call in a thread
