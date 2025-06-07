@@ -123,6 +123,7 @@ class GeminiTranslator(BaseTranslator):
         "vertex_service_account_file": {
             "value": "",
             "description": "Path to Vertex AI service account JSON file. If empty, uses environment variables.",
+            "path_selector": True, # 찾아보기 버튼 활성화
         },
         "vertex_location": {
             "value": "us-central1",
