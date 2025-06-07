@@ -55,6 +55,7 @@ class GenAITranslator(BaseTranslator):
             'options': [
                 'gemini-2.0-flash',
                 'gemini-2.5-flash-preview-05-20',
+                'gemini-2.5-pro-preview-06-05',
                 'gemini-2.5-pro-exp-03-25', # Included for broader compatibility
             ],
             'value': 'gemini-1.5-flash-latest',
