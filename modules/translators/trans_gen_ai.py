@@ -163,19 +163,78 @@ DANGEROUS_CONTENT:BLOCK_NONE""",
         self.executor = None # Will be initialized later
         self._initialize_client()
 
+    @property
+    def auth_method(self) -> str:
+        return self._get_param_value('auth_method', 'API Key')
+
+    @property
+    def api_key(self) -> Optional[str]:
+        return self._get_param_value('api_key')
+
+    @property
+    def service_account_json_path(self) -> Optional[str]:
+        return self._get_param_value('service_account_json_path')
+
+    @property
+    def proxy(self) -> Optional[str]:
+        return self._get_param_value('proxy')
+
+    @property
+    def model_name(self) -> str:
+        return self._get_param_value('override_model_name') or self._get_param_value('model_name')
+
+    @property
+    def system_prompt_template(self) -> str:
+        return self._get_param_value('system_prompt_template')
+
+    @property
+    def user_prompt_template(self) -> str:
+        return self._get_param_value('user_prompt_template')
+
+    @property
+    def max_output_tokens(self) -> int:
+        return int(self._get_param_value('max_output_tokens', 2048))
+
+    @property
+    def temperature(self) -> float:
+        return float(self._get_param_value('temperature', 0.5))
+
+    @property
+    def top_p(self) -> float:
+        return float(self._get_param_value('top_p', 1.0))
+
+    @property
+    def top_k(self) -> int:
+        return int(self._get_param_value('top_k', 40))
+
+    @property
+    def retry_attempts(self) -> int:
+        return int(self._get_param_value('retry_attempts', 3))
+
+    @property
+    def retry_timeout(self) -> int:
+        return int(self._get_param_value('retry_timeout', 10))
+
+    @property
+    def delay(self) -> float:
+        return float(self._get_param_value('delay', 1.0))
+
+    @property
+    def max_requests_per_minute(self) -> int:
+        return int(self._get_param_value('max_requests_per_minute', 0))
+
+    @property
+    def max_parallel_requests(self) -> int:
+        return int(self._get_param_value('max_parallel_requests', 5))
+
     def _initialize_client(self):
-        auth_method = self._get_param_value('auth_method', 'API Key')
-        api_key = self._get_param_value('api_key')
-        sa_json_path = self._get_param_value('service_account_json_path')
-        proxy_str = self._get_param_value('proxy')
         self.client = None # Ensure client is reset
 
         # Initialize or re-initialize ThreadPoolExecutor
-        max_workers = int(self._get_param_value('max_parallel_requests', 5))
         if self.executor:
             self.executor.shutdown(wait=False) # Shutdown existing executor
-        self.executor = ThreadPoolExecutor(max_workers=max_workers if max_workers > 0 else None)
-        self.logger.info(f"ThreadPoolExecutor initialized with max_workers={max_workers if max_workers > 0 else 'default'}")
+        self.executor = ThreadPoolExecutor(max_workers=self.max_parallel_requests if self.max_parallel_requests > 0 else None)
+        self.logger.info(f"ThreadPoolExecutor initialized with max_workers={self.max_parallel_requests if self.max_parallel_requests > 0 else 'default'}")
         # Reset any previous global genai configuration
         # This is important because genai.configure is global.
         try:
@@ -184,51 +243,51 @@ DANGEROUS_CONTENT:BLOCK_NONE""",
             self.logger.warning(f"Could not reset genai global configuration: {e}")
 
         try:
-            if proxy_str:
-                self.logger.info(f"Proxy '{proxy_str}' is set. Ensure HTTP_PROXY/HTTPS_PROXY environment variables are configured if SDK does not pick this up directly.")
+            if self.proxy:
+                self.logger.info(f"Proxy '{self.proxy}' is set. Ensure HTTP_PROXY/HTTPS_PROXY environment variables are configured if SDK does not pick this up directly.")
 
-            if auth_method == 'Service Account JSON':
+            if self.auth_method == 'Service Account JSON':
                 if not _GOOGLE_AUTH_AVAILABLE:
                     self.logger.error("Python package 'google-auth' is not installed. Please install it to use Service Account authentication (e.g., pip install google-auth).")
                     self.params['gcp_project_id_display']['value'] = "google-auth missing"
                     return
-                if sa_json_path and os.path.exists(sa_json_path):
-                    project_id = self._parse_project_id_from_sa(sa_json_path)
+                if self.service_account_json_path and os.path.exists(self.service_account_json_path):
+                    project_id = self._parse_project_id_from_sa(self.service_account_json_path)
                     if project_id:
                         self.params['gcp_project_id_display']['value'] = project_id
-                        self.logger.info(f"Attempting to initialize with Service Account: {sa_json_path}, Project ID: {project_id}")
+                        self.logger.info(f"Attempting to initialize with Service Account: {self.service_account_json_path}, Project ID: {project_id}")
                     else:
                         self.params['gcp_project_id_display']['value'] = "Parse Error"
-                        self.logger.warning(f"Could not parse project_id from SA file: {sa_json_path}. Proceeding with SA file for auth.")
+                        self.logger.warning(f"Could not parse project_id from SA file: {self.service_account_json_path}. Proceeding with SA file for auth.")
 
-                    credentials = service_account.Credentials.from_service_account_file(sa_json_path)
+                    credentials = service_account.Credentials.from_service_account_file(self.service_account_json_path)
                     genai.configure(credentials=credentials)
                     self.client = genai.Client()
                     self.logger.info("Google GenAI client initialized using Service Account JSON.")
-                elif sa_json_path: # Path provided but does not exist
-                    self.logger.error(f"Service Account JSON file not found: {sa_json_path}")
+                elif self.service_account_json_path: # Path provided but does not exist
+                    self.logger.error(f"Service Account JSON file not found: {self.service_account_json_path}")
                     self.params['gcp_project_id_display']['value'] = "File Not Found"
                 else: # No path provided
                     self.logger.error("Auth method is 'Service Account JSON' but no path is provided.")
                     self.params['gcp_project_id_display']['value'] = "Path Not Set"
 
-            elif auth_method == 'API Key':
+            elif self.auth_method == 'API Key':
                 self.params['gcp_project_id_display']['value'] = 'N/A (API Key Auth)'
-                if api_key:
+                if self.api_key:
                     self.logger.info("Initializing Google GenAI client with API key.")
-                    genai.configure(api_key=api_key)
+                    genai.configure(api_key=self.api_key)
                     self.client = genai.Client()
                 else:
                     self.logger.info("API key not provided for 'API Key' auth. Attempting Application Default Credentials (ADC).")
                     self.logger.info("Ensure GOOGLE_APPLICATION_CREDENTIALS env var is set or running in a configured Google Cloud environment.")
                     self.client = genai.Client() # ADC will be used
             else:
-                self.logger.error(f"Unknown authentication method: {auth_method}")
+                self.logger.error(f"Unknown authentication method: {self.auth_method}")
                 self.params['gcp_project_id_display']['value'] = "Invalid Auth Method"
 
             if self.client:
                 self.parsed_safety_settings = self._parse_safety_settings()
-                self.logger.info(f"Google GenAI client initialized successfully. Auth Method: {auth_method}. Safety Settings: {self.parsed_safety_settings or 'SDK defaults'}")
+                self.logger.info(f"Google GenAI client initialized successfully. Auth Method: {self.auth_method}. Safety Settings: {self.parsed_safety_settings or 'SDK defaults'}")
             else:
                 # Ensure parsed_safety_settings is initialized even on client init failure,
                 # as _parse_safety_settings doesn't depend on the client.
@@ -237,12 +296,12 @@ DANGEROUS_CONTENT:BLOCK_NONE""",
 
         except Exception as e:
             self.logger.error(f"Failed to initialize Google GenAI client: {e}")
-            if auth_method == 'API Key' and not api_key: # ADC attempt failed
+            if self.auth_method == 'API Key' and not self.api_key: # ADC attempt failed
                 if isinstance(e, google.auth.exceptions.DefaultCredentialsError) or \
                    "Could not find Application Default Credentials" in str(e) or \
                    "default credentials" in str(e).lower():
                     self.logger.error("ADC failure: Ensure GOOGLE_APPLICATION_CREDENTIALS is set correctly, or the environment (e.g., GCE, GKE, Cloud Functions) has a service account with necessary permissions.")
-            elif auth_method == 'Service Account JSON' and 'gcp_project_id_display' in self.params:
+            elif self.auth_method == 'Service Account JSON' and 'gcp_project_id_display' in self.params:
                  self.params['gcp_project_id_display']['value'] = "Init Error"
 
             self.logger.debug(traceback.format_exc())
@@ -301,8 +360,7 @@ DANGEROUS_CONTENT:BLOCK_NONE""",
 
     def _respect_delay(self):
         # RPM Limit Logic
-        max_rpm = int(self._get_param_value('max_requests_per_minute', 0))
-        if max_rpm > 0:
+        if self.max_requests_per_minute > 0:
             current_time_for_rpm = time.time()
             # Check if a minute has passed since minute_start_time
             if current_time_for_rpm - self.minute_start_time >= 60:
@@ -310,12 +368,12 @@ DANGEROUS_CONTENT:BLOCK_NONE""",
                 self.minute_start_time = current_time_for_rpm # Reset to current time
 
             # Check if RPM limit is reached
-            if self.request_count_minute >= max_rpm:
+            if self.request_count_minute >= self.max_requests_per_minute:
                 # Calculate time until the current 60-second window ends
                 wait_time = (self.minute_start_time + 60) - current_time_for_rpm
                 if wait_time > 0:
                     self.logger.warning(
-                        f"Global RPM limit ({max_rpm}) reached. Waiting {wait_time:.2f} seconds."
+                        f"Global RPM limit ({self.max_requests_per_minute}) reached. Waiting {wait_time:.2f} seconds."
                     )
                     time.sleep(wait_time)
                 # After waiting, the new minute effectively starts
@@ -325,15 +383,14 @@ DANGEROUS_CONTENT:BLOCK_NONE""",
         # Fixed Delay Logic (runs after potential RPM sleep)
         current_time_for_fixed_delay = time.time()
         time_since_last_request = current_time_for_fixed_delay - self.last_request_time
-        required_delay = float(self._get_param_value('delay', 1.0))
-        if time_since_last_request < required_delay:
-            sleep_time = required_delay - time_since_last_request
+        if time_since_last_request < self.delay:
+            sleep_time = self.delay - time_since_last_request
             if sleep_time > 0: # Ensure sleep_time is positive
                 self.logger.debug(f"Waiting {sleep_time:.2f} seconds (fixed delay) before next GenAI request.")
                 time.sleep(sleep_time)
 
         self.last_request_time = time.time()
-        if max_rpm > 0:
+        if self.max_requests_per_minute > 0:
             self.request_count_minute += 1
 
     def _make_api_call(self, text_to_translate: str, model_to_use: str, generation_config_dict: Dict, safety_settings: Optional[Dict]) -> Tuple[str, Optional[Any]]:
@@ -350,11 +407,11 @@ DANGEROUS_CONTENT:BLOCK_NONE""",
         from_lang_for_prompt = self.lang_map.get(from_lang_display, from_lang_display)
         to_lang_for_prompt = self.lang_map.get(to_lang_display, to_lang_display)
 
-        system_instruction = self._get_param_value('system_prompt_template').format(
+        system_instruction = self.system_prompt_template.format(
             from_lang=from_lang_for_prompt,
             to_lang=to_lang_for_prompt
         )
-        user_content_prompt = self._get_param_value('user_prompt_template').format(
+        user_content_prompt = self.user_prompt_template.format(
             text_to_translate=text_to_translate
         )
         
@@ -411,15 +468,14 @@ DANGEROUS_CONTENT:BLOCK_NONE""",
             return index, "[Client Error: Not initialized]"
 
         translated_text = ""
-        max_attempts = self._get_param_value('retry_attempts', 3)
         
         # Prepare these once per text_to_translate to pass to _make_api_call
-        model_to_use = self._get_param_value('override_model_name') or self._get_param_value('model_name')
+        model_to_use = self.model_name
         generation_config_dict = {
-            'max_output_tokens': int(self._get_param_value('max_output_tokens')),
-            'temperature': float(self._get_param_value('temperature')),
-            'top_p': float(self._get_param_value('top_p')),
-            'top_k': int(self._get_param_value('top_k')),
+            'max_output_tokens': self.max_output_tokens,
+            'temperature': self.temperature,
+            'top_p': self.top_p,
+            'top_k': self.top_k,
         }
         safety_settings = self.parsed_safety_settings
 
@@ -458,16 +514,16 @@ DANGEROUS_CONTENT:BLOCK_NONE""",
                 break 
             except GenAIAPIError as e:
                 self.logger.warning(f"Attempt {attempt + 1} for item {index+1} (\"{text_to_translate[:50]}...\") failed: {e}")
-                if attempt < max_attempts:
-                    await asyncio.sleep(self._get_param_value('retry_timeout', 10))
+                if attempt < self.retry_attempts:
+                    await asyncio.sleep(self.retry_timeout)
                 else:
-                    self.logger.error(f"All {max_attempts + 1} attempts failed for item {index+1} (\"{text_to_translate[:50]}...\").")
+                    self.logger.error(f"All {self.retry_attempts + 1} attempts failed for item {index+1} (\"{text_to_translate[:50]}...\").")
                     translated_text = str(e) # Return the error message as translation
             except Exception as e: 
                 self.logger.error(f"Unexpected error on attempt {attempt + 1} for item {index+1} (\"{text_to_translate[:50]}...\"): {e}")
                 self.logger.debug(traceback.format_exc())
-                if attempt < max_attempts:
-                    await asyncio.sleep(self._get_param_value('retry_timeout', 10))
+                if attempt < self.retry_attempts:
+                    await asyncio.sleep(self.retry_timeout)
                 else:
                     translated_text = f"[Unexpected Translation Error: {e}]"
         return index, translated_text
@@ -495,24 +551,23 @@ DANGEROUS_CONTENT:BLOCK_NONE""",
                 continue
 
             translated_text = ""
-            max_attempts = self._get_param_value('retry_attempts', 3)
-            for attempt in range(max_attempts + 1):
+            for attempt in range(self.retry_attempts + 1):
                 try:
-                    self.logger.info(f"Translating text ({i+1}/{num_texts}): \"{src_text[:50]}...\" (Attempt {attempt+1}/{max_attempts+1})")
+                    self.logger.info(f"Translating text ({i+1}/{num_texts}): \"{src_text[:50]}...\" (Attempt {attempt+1}/{self.retry_attempts+1})")
                     translated_text = self._request_translation(src_text)
                     break 
                 except GenAIAPIError as e:
                     self.logger.warning(f"Attempt {attempt + 1} failed for \"{src_text[:50]}...\": {e}")
-                    if attempt < max_attempts:
-                        time.sleep(self._get_param_value('retry_timeout', 10))
+                    if attempt < self.retry_attempts:
+                        time.sleep(self.retry_timeout)
                     else:
-                        self.logger.error(f"All {max_attempts + 1} attempts failed for \"{src_text[:50]}...\".")
+                        self.logger.error(f"All {self.retry_attempts + 1} attempts failed for \"{src_text[:50]}...\".")
                         translated_text = f"[Translation Error: {e}]" 
                 except Exception as e: 
                     self.logger.error(f"Unexpected error on attempt {attempt + 1} for \"{src_text[:50]}...\": {e}")
                     self.logger.debug(traceback.format_exc())
-                    if attempt < max_attempts:
-                        time.sleep(self._get_param_value('retry_timeout', 10))
+                    if attempt < self.retry_attempts:
+                        time.sleep(self.retry_timeout)
                     else:
                         translated_text = f"[Unexpected Translation Error: {e}]"
             translations.append(translated_text)
@@ -520,7 +575,7 @@ DANGEROUS_CONTENT:BLOCK_NONE""",
 
     def updateParam(self, param_key: str, param_content):
         super().updateParam(param_key, param_content)
-        critical_params = ['auth_method', 'api_key', 'service_account_json_path', 'proxy', 'safety_settings']
+        critical_params = ['auth_method', 'api_key', 'service_account_json_path', 'proxy', 'safety_settings', 'max_parallel_requests']
         if param_key in critical_params:
             self.logger.info(f"Parameter '{param_key}' updated. Re-initializing Google GenAI client.")
             self._initialize_client()
