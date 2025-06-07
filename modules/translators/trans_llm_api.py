@@ -5,7 +5,10 @@ import traceback
 from typing import List, Dict, Optional
 
 import httpx
-import google.genai as genai # 수정된 임포트 구문
+from google import genai # 공식 문서에 따른 import
+from google.genai import types as genai_types # 공식 google-genai SDK에 따른 types import (이전 SDK에서는 from google.generativeai.types)
+
+
 
 from .base import BaseTranslator, register_translator
 
@@ -14,7 +17,7 @@ class InvalidNumTranslations(Exception):
     pass
 
 
-@register_translator("Gemini")
+@register_translator("LLM_API_Translator")
 class GeminiTranslator(BaseTranslator):
     concate_text = False
     cht_require_convert = True
@@ -31,11 +34,12 @@ class GeminiTranslator(BaseTranslator):
         "model": {
             "type": "selector",
             "options": [
-                "gemini-1.5-pro-latest",
-                "gemini-1.5-flash-latest",
-                "gemini-1.0-pro",
+                "gemini-2.5-pro-preview-06-05",
+                "gemini-2.5-flash-preview-05-20",
+                "gemini-2.0-flash",
+                "gemini-2.5-pro-exp-03-25",
             ],
-            "value": "gemini-1.5-flash-latest",
+            "value": "gemini-2.0-flash",
             "description": "Select the Gemini model.",
         },
         "override model": {
@@ -144,36 +148,32 @@ class GeminiTranslator(BaseTranslator):
         self.request_count_minute = 0
         self.minute_start_time = time.time()
         self.key_usage = {}  # {api_key: (count, minute_start_time)}
-        self.model_client = None # Gemini 모델 클라이언트
-        self._initialize_client()
+        self.client = None # Google Gen AI Client
 
-    def _initialize_client(self):
+    def _ensure_client(self):
+        """새로운 SDK 방식으로 클라이언트 초기화"""
+        current_api_key = self._select_api_key()
+        if not current_api_key:
+            self.logger.error("No API key available for translation.")
+            raise ValueError("No API key available.")
+        
+        # 프록시 설정은 genai.Client 생성 시 직접 지원하지 않음.
+        # google-genai는 일반적으로 HTTP_PROXY/HTTPS_PROXY 환경 변수를 사용합니다.
+        # httpx_client를 명시적으로 전달하여 프록시를 설정할 수 있으나,
+        # 여기서는 환경 변수 사용을 권장하는 로그만 남깁니다.
         if self.proxy:
             self.logger.info(
                 f"Proxy configured: {self.proxy}. Ensure your environment (HTTP_PROXY, HTTPS_PROXY) is set up for google-generativeai SDK."
             )
 
-        api_keys = self.multiple_keys_list
-        api_key_to_use = api_keys[0] if api_keys else self.apikey
-
-        if not api_key_to_use:
-            self.logger.warning(
-                "No API key provided. Please set either 'apikey' or 'multiple_keys'."
-            )
-            self.model_client = None
-            return
-
-        masked_key = api_key_to_use[:6] + "*" * (len(api_key_to_use) - 6)
-        self.logger.debug(f"Configuring Google GenAI with initial API key: {masked_key}")
-        
-        try:
-            genai.configure(api_key=api_key_to_use) # 실제 요청 시점에 키 변경 가능
-            model_name = self.override_model or self.model
-            self.model_client = genai.GenerativeModel(model_name)
-        except Exception as e:
-            self.logger.error(f"Failed to initialize Gemini client or model: {e}")
-            self.model_client = None
-
+        if not self.client: # 또는 API 키가 변경된 경우 클라이언트 재생성 (여기서는 단순화)
+            try:
+                self.client = genai.Client(api_key=current_api_key)
+                self.logger.debug(f"Initialized Google Gen AI client")
+            except Exception as e:
+                self.logger.error(f"Failed to initialize client: {e}")
+                self.client = None
+                raise
 
     @property
     def apikey(self) -> str:
@@ -384,40 +384,15 @@ class GeminiTranslator(BaseTranslator):
     def _request_translation(self, prompt: str, chat_sample: Optional[List[str]]) -> str:
         self._respect_delay()
 
-        current_api_key = self._select_api_key()
-        if not current_api_key:
-            self.logger.error("No API key available for translation.")
-            return "Error: No API key provided."
+        try:
+            self._ensure_client()  # configure 대신 client 초기화
+        except ValueError as ve: # No API key available
+            return str(ve)
+        except Exception as e:
+            self.logger.error(f"Error during client initialization: {e}")
+            return f"Error: Client initialization failed - {e}"
 
-        # API 키 변경 시 genai 재설정
-        # genai.configure는 전역 설정이므로, 현재 설정된 키와 다를 경우에만 호출
-        # (주의: genai 라이브러리에 현재 설정된 키를 직접 가져오는 API가 없을 수 있음.
-        #  이 경우, 마지막으로 설정한 키를 self에 저장하여 비교하거나, 매번 호출)
-        if not hasattr(self, '_current_genai_api_key') or self._current_genai_api_key != current_api_key:
-            try:
-                genai.configure(api_key=current_api_key)
-                self._current_genai_api_key = current_api_key
-                masked_key = current_api_key[:6] + "*" * (len(current_api_key) - 6)
-                self.logger.debug(f"Configured GenAI with API key: {masked_key}")
-            except Exception as e:
-                self.logger.error(f"Failed to configure GenAI with API key: {e}")
-                return f"Error: Failed to configure API key."
-
-        model_name_from_param = self.override_model or self.model
-        
-        # 모델 클라이언트 재설정 (모델 이름이 변경되었을 수 있으므로)
-        if not self.model_client or self.model_client.model_name != model_name_from_param:
-            try:
-                self.model_client = genai.GenerativeModel(model_name_from_param)
-                self.logger.debug(f"Initialized Gemini model: {model_name_from_param}")
-            except Exception as e:
-                self.logger.error(f"Failed to initialize Gemini model {model_name_from_param}: {e}")
-                return f"Error: Failed to initialize model {model_name_from_param}."
-        
-        result = self._request_translation_with_chat_sample_google(
-            prompt, chat_sample
-        )
-
+        result = self._request_translation_with_chat_sample_google(prompt, chat_sample)
         if not isinstance(result, str):
             result = str(result)
         return result
@@ -425,56 +400,62 @@ class GeminiTranslator(BaseTranslator):
     def _request_translation_with_chat_sample_google(
         self, prompt: str, chat_sample: Optional[List[str]]
     ) -> str:
-        if not self.model_client:
-            self.logger.error("Gemini model client is not initialized.")
-            return "Error: Model client not initialized."
+        if not self.client:
+            self.logger.error("Client is not initialized.")
+            return "Error: Client not initialized."
 
-        # Gemini API는 messages 대신 contents를 사용하고, role도 user/model로 다름
-        gemini_contents = []
+        model_name = self.override_model or self.model
         
-        # 시스템 프롬프트 추가 (첫 번째 user 메시지에 결합)
-        current_user_prompt_parts = [self.chat_system_template, prompt]
 
+        # Contents는 사용자 메시지만 포함
+
+        contents = []
+        
         if chat_sample:
-            # 샘플 유저 메시지
-            gemini_contents.append({"role": "user", "parts": [{"text": chat_sample[0]}]})
-            # 샘플 모델 응답
-            gemini_contents.append({"role": "model", "parts": [{"text": chat_sample[1]}]})
+            # 샘플 대화 추가
+            contents.extend([
+                {"role": "user", "parts": [{"text": chat_sample[0]}]},
+                {"role": "model", "parts": [{"text": chat_sample[1]}]}
+            ])
         
-        # 실제 번역 요청 프롬프트 (시스템 프롬프트와 결합됨)
-        gemini_contents.append({"role": "user", "parts": [{"text": "\n".join(current_user_prompt_parts)}]})
+        # 실제 요청 프롬프트 추가 (시스템 프롬프트와 결합)
+        contents.append({
+            "role": "user", 
+            "parts": [{"text": prompt}] # 시스템 프롬프트는 system_instruction으로 분리
+        })
 
-
-        generation_config = genai.types.GenerationConfig(
+        # GenerateContentConfig 사용
+        config = genai_types.GenerateContentConfig(
+            system_instruction=self.chat_system_template,  # 문자열로 직접 전달
             max_output_tokens=self.max_tokens, # Gemini는 max_output_tokens 사용
             temperature=self.temperature, 
-            top_p=self.top_p 
+            top_p=self.top_p,
+            safety_settings=[
+                genai_types.SafetySetting(
+                    category="HARM_CATEGORY_HARASSMENT",
+                    threshold="BLOCK_NONE"
+                ),
+                genai_types.SafetySetting(
+                    category="HARM_CATEGORY_HATE_SPEECH", 
+                    threshold="BLOCK_NONE"
+                ),
+                genai_types.SafetySetting(
+                    category="HARM_CATEGORY_SEXUALLY_EXPLICIT",
+                    threshold="BLOCK_NONE"
+                ),
+                genai_types.SafetySetting(
+                    category="HARM_CATEGORY_DANGEROUS_CONTENT",
+                    threshold="BLOCK_NONE"
+                ),
+            ]
         )
-        
-        safety_settings = [ # 모든 안전 설정을 비활성화 (번역 작업에 불필요)
-            {
-                "category": "HARM_CATEGORY_HARASSMENT",
-                "threshold": "BLOCK_NONE",
-            },
-            {
-                "category": "HARM_CATEGORY_HATE_SPEECH",
-                "threshold": "BLOCK_NONE",
-            },
-            {
-                "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
-                "threshold": "BLOCK_NONE",
-            },
-            {
-                "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
-                "threshold": "BLOCK_NONE",
-            },
-        ]
 
         try:
-            response = self.model_client.generate_content(
-                contents=gemini_contents,
-                generation_config=generation_config,
-                safety_settings=safety_settings
+            # 올바른 API 호출 방법
+            response = self.client.models.generate_content(
+                model=model_name,  # "models/" 접두사 불필요
+                contents=contents,
+                config=config  # generation_config 대신 config 사용
             )
         except Exception as e:
             self.logger.error(f"Gemini API request failed: {e}")
@@ -482,8 +463,14 @@ class GeminiTranslator(BaseTranslator):
             return f"Error: API request failed - {e}"
 
 
-        if response.candidates and response.candidates[0].content.parts:
-            return response.candidates[0].content.parts[0].text
+        # 응답 검증
+        if not response or not hasattr(response, 'text'):
+            self.logger.warning(f"Empty or invalid response received. Prompt: {prompt[:100]}... Response: {response}")
+            return "Error: Invalid response format"
+        
+        if response.text:
+
+            return response.text
         
         self.logger.warning(f"No content found in Gemini response. Prompt: {prompt[:100]}... Response: {response}")
         return ""
@@ -547,11 +534,10 @@ class GeminiTranslator(BaseTranslator):
             f"updateParam called for key: {param_key}, content: {param_content}"
         )
         if param_key in [
-            "proxy",
-            "apikey",
-            "model",
-            "override_model",
-            "multiple_keys",
+            "apikey", # API 키 변경 시 클라이언트 재설정
+            "multiple_keys", # 위와 동일
+            "proxy", # 프록시 변경 시 클라이언트 재설정 (환경 변수 외 명시적 설정 시)
+            "model", 
+            "override_model", 
         ]:
-            self._initialize_client()
-
+            self.client = None # 클라이언트 재초기화 플래그
