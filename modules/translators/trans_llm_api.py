@@ -5,7 +5,7 @@ import traceback
 from typing import List, Dict, Optional
 
 import httpx
-from openai import OpenAI
+import google.genai as genai # 수정된 임포트 구문
 
 from .base import BaseTranslator, register_translator
 
@@ -14,46 +14,33 @@ class InvalidNumTranslations(Exception):
     pass
 
 
-@register_translator("LLM_API_Translator")
-class LLM_API_Translator(BaseTranslator):
+@register_translator("Gemini")
+class GeminiTranslator(BaseTranslator):
     concate_text = False
     cht_require_convert = True
     params: Dict = {
-        "provider": {
-            "type": "selector",
-            "options": ["OpenAI", "Google"],
-            "value": "OpenAI",
-            "description": "Select the LLM provider.",
-        },
-        "apikey": {  # Один API-ключ, если не заданы несколько
+        "apikey": {
             "value": "",
-            "description": "Single API key to use if multiple keys are not provided.",
+            "description": "API key for Google Gemini.",
         },
         "multiple_keys": {
             "type": "editor",
             "value": "",
-            "description": "API keys separated by semicolons (;). One key per line for readability.",
+            "description": "Multiple API keys separated by semicolons (;). One key per line for readability. Rotates keys to manage RPM limits.",
         },
         "model": {
             "type": "selector",
             "options": [
-                "OAI: gpt-4o",
-                "OAI: gpt-4-turbo",
-                "OAI: gpt-3.5-turbo",
-                "GGL: gemini-1.5-pro-latest",
-                "GGL: gemini-2.0-flash-exp",
-                "GGL: gemini-2.0-flash",
+                "gemini-1.5-pro-latest",
+                "gemini-1.5-flash-latest",
+                "gemini-1.0-pro",
             ],
-            "value": "",
-            "description": "Select the model. Provider prefix indicates the provider. Leave empty for provider default.",
+            "value": "gemini-1.5-flash-latest",
+            "description": "Select the Gemini model.",
         },
         "override model": {
             "value": "",
-            "description": "Specify a custom model name to override the selected model.",
-        },
-        "endpoint": {
-            "value": "",
-            "description": "Base URL for the API. Leave empty to use provider default.",
+            "description": "Specify a custom Gemini model name to override the selection (e.g., specific version).",
         },
         "prompt template": {
             "type": "editor",
@@ -78,7 +65,7 @@ class LLM_API_Translator(BaseTranslator):
         - 二里酱
         - 我听说人们会把亲吻作为与喜爱的朋友打招呼的方式
         - 我给了她冰激凌
-        - 喜多酱 и你是怎么样的关系啊...
+        - 喜多酱和你是怎么样的关系啊...
         - 我在电视上看到的！""",
         },
         "invalid repeat count": {
@@ -86,7 +73,7 @@ class LLM_API_Translator(BaseTranslator):
             "description": "Number of invalid repeat counts before considering translation failed.",
         },
         "max requests per minute": {
-            "value": 20,
+            "value": 20, # Gemini API는 분당 요청 수 제한(RPM)이 있으므로 이 값을 사용합니다.
             "description": "Maximum requests per minute for EACH API key.",
         },
         "delay": {
@@ -94,16 +81,16 @@ class LLM_API_Translator(BaseTranslator):
             "description": "Global delay in seconds between requests.",
         },
         "max tokens": {
-            "value": 4096,
-            "description": "Maximum tokens for the response.",
+            "value": 4096, # Gemini는 max_output_tokens로 제어합니다.
+            "description": "Maximum output tokens for the response.",
         },
         "temperature": {
             "value": 0.5,
-            "description": "Temperature for sampling (OpenAI). Google models may ignore this.",
+            "description": "Controls randomness. Lower for more deterministic, higher for more creative.",
         },
         "top p": {
             "value": 1.,
-            "description": "Top P for sampling. Forced to 1 for Google models.",
+            "description": "Top P for sampling. Consider values like 0.95.",
         },
         "retry attempts": {
             "value": 5,
@@ -115,13 +102,8 @@ class LLM_API_Translator(BaseTranslator):
         },
         "proxy": {
             "value": "",
-            "description": "Proxy address (e.g., http(s)://user:password@host:port or socks4/5://user:password@host:port)",
+            "description": "Proxy address (e.g., http(s)://user:password@host:port or socks4/5://user:password@host:port). Note: google-genai SDK uses HTTP_PROXY/HTTPS_PROXY environment variables.",
         },
-        "frequency penalty": {
-            "value": 0.0,
-            "description": "Frequency penalty (OpenAI).",
-        },
-        "presence penalty": {"value": 0.0, "description": "Presence penalty (OpenAI)."},
         "low vram mode": {
             "value": False,
             "description": "Check if running locally and facing VRAM issues.",
@@ -155,61 +137,43 @@ class LLM_API_Translator(BaseTranslator):
             "Tamil": "Tamil",
             "Hindi": "Hindi",
         }
-        self.token_count = 0
+        self.token_count = 0 # Gemini API는 현재 토큰 사용량을 직접 반환하지 않습니다.
         self.token_count_last = 0
         self.current_key_index = 0
         self.last_request_time = 0
         self.request_count_minute = 0
         self.minute_start_time = time.time()
-        # Для контроля лимита по каждому ключу:
-        self.key_usage = {}  # { api_key: (count, minute_start_time) }
+        self.key_usage = {}  # {api_key: (count, minute_start_time)}
+        self.model_client = None # Gemini 모델 클라이언트
         self._initialize_client()
 
     def _initialize_client(self):
-        # Настраиваем httpx клиент с поддержкой proxy
         if self.proxy:
-            proxy_mounts = {
-                "http://": httpx.HTTPTransport(proxy=self.proxy),
-                "https://": httpx.HTTPTransport(proxy=self.proxy),
-            }
-            transport = httpx.Client(mounts=proxy_mounts)
-        else:
-            transport = httpx.Client()
+            self.logger.info(
+                f"Proxy configured: {self.proxy}. Ensure your environment (HTTP_PROXY, HTTPS_PROXY) is set up for google-generativeai SDK."
+            )
 
-        # Определяем API-ключ: если заданы несколько, берём первый
         api_keys = self.multiple_keys_list
-        if api_keys:
-            api_key_to_use = api_keys[0]
-        else:
-            api_key_to_use = self.apikey
+        api_key_to_use = api_keys[0] if api_keys else self.apikey
 
         if not api_key_to_use:
             self.logger.warning(
                 "No API key provided. Please set either 'apikey' or 'multiple_keys'."
             )
-            self.client = None
+            self.model_client = None
             return
 
-        # Определяем endpoint: если не задан, выбираем по провайдеру
-        endpoint = self.endpoint
-        if not endpoint:
-            if self.provider == "Google":
-                endpoint = "https://generativelanguage.googleapis.com/v1beta/openai"
-            else:
-                endpoint = "https://api.openai.com/v1"
-
-        # Маскируем API ключ в логах – показываем только первые 6 символов
         masked_key = api_key_to_use[:6] + "*" * (len(api_key_to_use) - 6)
-        self.logger.debug(
-            f"Initializing OpenAI client with API key: {masked_key} and endpoint: {endpoint}"
-        )
-        self.client = OpenAI(
-            api_key=api_key_to_use, base_url=endpoint, http_client=transport
-        )
+        self.logger.debug(f"Configuring Google GenAI with initial API key: {masked_key}")
+        
+        try:
+            genai.configure(api_key=api_key_to_use) # 실제 요청 시점에 키 변경 가능
+            model_name = self.override_model or self.model
+            self.model_client = genai.GenerativeModel(model_name)
+        except Exception as e:
+            self.logger.error(f"Failed to initialize Gemini client or model: {e}")
+            self.model_client = None
 
-    @property
-    def provider(self) -> str:
-        return self.get_param_value("provider")
 
     @property
     def apikey(self) -> str:
@@ -229,10 +193,6 @@ class LLM_API_Translator(BaseTranslator):
         return self.get_param_value("override model") or None
 
     @property
-    def endpoint(self) -> Optional[str]:
-        return self.get_param_value("endpoint") or None
-
-    @property
     def temperature(self) -> float:
         return float(self.get_param_value("temperature"))
 
@@ -241,7 +201,7 @@ class LLM_API_Translator(BaseTranslator):
         return float(self.get_param_value("top p"))
 
     @property
-    def max_tokens(self) -> int:
+    def max_tokens(self) -> int: # Gemini에서는 max_output_tokens
         return int(self.get_param_value("max tokens"))
 
     @property
@@ -263,31 +223,30 @@ class LLM_API_Translator(BaseTranslator):
 
     @property
     def chat_sample(self):
-        model_name = self.model
-        if model_name == "gpt3":
-            return None
-        samples = self.params["chat sample"]["value"]
+        samples_str = self.get_param_value("chat sample")
         try:
-            samples = yaml.load(
-                self.params["chat sample"]["value"], Loader=yaml.FullLoader
-            )
+            samples = yaml.load(samples_str, Loader=yaml.FullLoader)
         except Exception as e:
-            self.logger.error(f"Failed to parse sample: {samples} - {e}")
+            self.logger.error(f"Failed to parse chat sample YAML: {samples_str} - {e}")
             return None
-        src_tgt = self.lang_source + "-" + self.lang_target
-        if src_tgt in samples:
-            sample_data = samples[src_tgt]
-            src_queries = "\n".join(
-                [f"<|{i+1}|>{s}" for i, s in enumerate(sample_data["source"])]
-            )
-            tgt_queries = "\n".join(
-                [f"<|{i+1}|>{t}" for i, t in enumerate(sample_data["target"])]
-            )
-            return [src_queries, tgt_queries]
+        
+        src_tgt_key = f"{self.lang_source}-{self.lang_target}"
+        if samples and src_tgt_key in samples:
+            sample_data = samples[src_tgt_key]
+            if "source" in sample_data and "target" in sample_data:
+                src_queries = "\n".join(
+                    [f"<|{i+1}|>{s}" for i, s in enumerate(sample_data["source"])]
+                )
+                tgt_queries = "\n".join(
+                    [f"<|{i+1}|>{t}" for i, t in enumerate(sample_data["target"])]
+                )
+                return [src_queries, tgt_queries]
+            else:
+                self.logger.warning(f"'{src_tgt_key}' in chat sample is missing 'source' or 'target' keys.")
         return None
 
     def _assemble_prompts(
-        self, queries: List[str], to_lang: str = None, max_tokens=None
+        self, queries: List[str], to_lang: str = None, max_tokens_override=None # max_tokens_override로 변경
     ):
         if to_lang is None:
             to_lang = self.lang_map[self.lang_target]
@@ -298,13 +257,18 @@ class LLM_API_Translator(BaseTranslator):
         num_src = 0
         i_offset = 0
 
-        if max_tokens is None:
-            max_tokens = self.max_tokens
+        # Gemini는 입력 토큰 제한도 고려해야 하므로, max_tokens를 출력 토큰으로만 사용
+        # 입력 길이 제어는 여기서 간단히 문자 수로 처리 (정확한 토큰화는 API 호출 전 수행)
+        # 이 부분은 더 정교한 토큰 기반 분할 로직으로 개선될 수 있습니다.
+        # 현재는 출력 max_tokens를 기준으로 분할합니다.
+        effective_max_tokens = max_tokens_override if max_tokens_override is not None else self.max_tokens
+
 
         for i, query in enumerate(queries):
             prompt += f"\n<|{i+1-i_offset}|>{query}"
             num_src += 1
-            if max_tokens * 2 and len("".join(queries[i + 1 :])) > max_tokens:
+            # Approximate check, real tokenization happens later
+            if effective_max_tokens * 2 and len("".join(queries[i + 1 :])) * 1.5 > effective_max_tokens : # 1.5는 문자당 평균 토큰 추정치
                 yield prompt.lstrip(), num_src
                 prompt = prompt_template
                 i_offset = i + 1
@@ -313,7 +277,7 @@ class LLM_API_Translator(BaseTranslator):
 
     def _format_prompt_log(self, prompt: str) -> str:
         chat_sample = self.chat_sample
-        if self.model != "gpt3" and chat_sample:
+        if chat_sample: # Gemini는 항상 chat sample을 사용할 수 있음
             return "\n".join(
                 [
                     "System:",
@@ -330,36 +294,28 @@ class LLM_API_Translator(BaseTranslator):
 
     def _respect_delay(self):
         current_time = time.time()
+        rpm_limit = int(self.get_param_value("max requests per minute"))
 
-        # Глобальный лимит запросов (если указан)
-        if int(self.params["max requests per minute"]["value"]) > 0:
+        if rpm_limit > 0:
             if current_time - self.minute_start_time >= 60:
                 self.request_count_minute = 0
                 self.minute_start_time = current_time
 
-            if self.request_count_minute >= int(
-                self.params["max requests per minute"]["value"]
-            ):
-                wait_time = 62 - (current_time - self.minute_start_time)
+            if self.request_count_minute >= rpm_limit:
+                wait_time = 60.1 - (current_time - self.minute_start_time) # 약간의 버퍼 추가
                 if wait_time > 0:
                     self.logger.warning(
-                        f"Reached global RPM limit. Waiting {wait_time:.2f} seconds."
+                        f"Reached global RPM limit ({rpm_limit}). Waiting {wait_time:.2f} seconds."
                     )
                     time.sleep(wait_time)
                 self.request_count_minute = 0
                 self.minute_start_time = time.time()
 
         time_since_last_request = current_time - self.last_request_time
-        if self.debug_mode:
-            self.logger.debug(
-                f"Time since last request: {time_since_last_request} seconds"
-            )
-
-        delay = float(self.params["delay"]["value"])
+        
+        delay = float(self.get_param_value("delay"))
         if time_since_last_request < delay:
             sleep_time = delay - time_since_last_request
-            if self.debug_mode:
-                self.logger.debug(f"Waiting {sleep_time} seconds before next request")
             time.sleep(sleep_time)
 
         self.last_request_time = time.time()
@@ -369,191 +325,169 @@ class LLM_API_Translator(BaseTranslator):
         rpm = int(self.get_param_value("max requests per minute"))
         if rpm <= 0:
             return
+        
         count, start_time = self.key_usage.get(key, (0, time.time()))
         now = time.time()
+
         if now - start_time >= 60:
-            self.key_usage[key] = (0, now)
-            return
+            self.key_usage[key] = (0, now) # 분이 지났으면 카운트 리셋
+            count = 0 # 아래 로직에서 사용하기 위해 업데이트
+        
         if count >= rpm:
-            wait_time = 60 - (now - start_time)
+            wait_time = 60.1 - (now - start_time) # 약간의 버퍼 추가
+            masked_key = key[:6] + "*" * (len(key) - 6)
             self.logger.warning(
-                f"Key {key[:6]}... reached RPM limit. Waiting {wait_time:.2f} seconds."
+                f"Key {masked_key} reached RPM limit ({rpm}). Waiting {wait_time:.2f} seconds."
             )
             time.sleep(wait_time)
-            self.key_usage[key] = (0, time.time())
+            self.key_usage[key] = (0, time.time()) # 대기 후 카운트 리셋
 
     def _select_api_key(self) -> str:
         api_keys = self.multiple_keys_list
-        if api_keys:
-            # Ротация ключей с учетом лимита по каждому
-            for _ in range(len(api_keys)):
-                index = self.current_key_index % len(api_keys)
-                key = api_keys[index]
-                self._respect_key_limit(key)
-                count, start_time = self.key_usage.get(key, (0, time.time()))
-                self.key_usage[key] = (count + 1, start_time)
-                self.current_key_index = (self.current_key_index + 1) % len(api_keys)
-                return key
-        else:
-            return self.apikey
+        if not api_keys:
+            return self.apikey # 단일 키 사용
 
-    def _request_translation_gpt3(self, prompt: str) -> str:
-        response = self.client.Completion.create(
-            model="text-davinci-003",
-            prompt=prompt,
-            max_tokens=self.max_tokens // 2,
-            temperature=self.temperature,
-            top_p=self.top_p,
-            frequency_penalty=float(self.params["frequency penalty"]["value"]),
-            presence_penalty=float(self.params["presence penalty"]["value"]),
-        )
+        # 여러 키가 있는 경우 로테이션
+        selected_key = None
+        for _ in range(len(api_keys)): # 모든 키를 한 번씩 확인
+            index = self.current_key_index % len(api_keys)
+            key_to_check = api_keys[index]
+            
+            count, start_time = self.key_usage.get(key_to_check, (0, time.time()))
+            now = time.time()
+            rpm_limit = int(self.get_param_value("max requests per minute"))
 
-        if response.choices:  # Проверка на наличие choices
-            if response.choices[0].text:  # Проверка на наличие text в первом choice
-                text_content = response.choices[0].text
-                if text_content is None:  # Проверка на None text_content
-                    if self.debug_mode:
-                        self.logger.warning("Completion text content is None.")
-                    return ""  # Возвращаем пустую строку, если text_content None
-            else:
-                if self.debug_mode:
-                    self.logger.warning("No text found in completion choice.")
-                return ""  # Возвращаем пустую строку, если нет text
-        else:
-            if self.debug_mode:
-                self.logger.warning("No choices found in completion response.")
-            return ""  # Возвращаем пустую строку, если нет choices
+            if now - start_time >= 60: # 1분이 지났으면 리셋
+                self.key_usage[key_to_check] = (0, now)
+                count = 0
+            
+            if rpm_limit <= 0 or count < rpm_limit: # RPM 제한이 없거나, 아직 여유가 있으면
+                selected_key = key_to_check
+                self.key_usage[selected_key] = (count + 1, start_time if now - start_time < 60 else now)
+                self.current_key_index = (index + 1) % len(api_keys) # 다음 요청을 위해 인덱스 이동
+                break
+            
+            self.current_key_index = (index + 1) % len(api_keys) # 다음 키로 넘어감
 
-        if response.usage:  # Проверка на наличие usage
-            self.token_count += response.usage.total_tokens
-            self.token_count_last = response.usage.total_tokens
-        else:
-            if self.debug_mode:
-                self.logger.warning("Usage data not found in completion response.")
-                self.token_count_last = (
-                    0  # Устанавливаем token_count_last в 0, если usage нет
-                )
+        if not selected_key: # 모든 키가 RPM 제한에 도달한 경우
+            # 가장 오래전에 사용된 (또는 곧 리셋될) 키를 선택하고 대기
+            # 간단하게 첫 번째 키를 선택하고 _respect_key_limit에서 대기하도록 함
+            selected_key = api_keys[self.current_key_index % len(api_keys)]
+            self._respect_key_limit(selected_key) # 여기서 대기 발생
+            count, start_time = self.key_usage.get(selected_key, (0, time.time()))
+            self.key_usage[selected_key] = (count + 1, start_time) # 사용량 업데이트
+            self.current_key_index = (self.current_key_index + 1) % len(api_keys)
 
-        return text_content  # Возвращаем text_content после всех проверок
+        return selected_key
 
-    def _request_translation(self, prompt: str, chat_sample: List[str]) -> str:
+
+    def _request_translation(self, prompt: str, chat_sample: Optional[List[str]]) -> str:
         self._respect_delay()
 
         current_api_key = self._select_api_key()
         if not current_api_key:
-            return (
-                "Error: No API key provided in 'apikey' or 'multiple_keys' parameter."
-            )
+            self.logger.error("No API key available for translation.")
+            return "Error: No API key provided."
 
-        provider = self.provider
-        model_name = self.override_model or self.model
-        if ": " in model_name:
-            model_name = model_name.split(": ", 1)[1]
+        # API 키 변경 시 genai 재설정
+        # genai.configure는 전역 설정이므로, 현재 설정된 키와 다를 경우에만 호출
+        # (주의: genai 라이브러리에 현재 설정된 키를 직접 가져오는 API가 없을 수 있음.
+        #  이 경우, 마지막으로 설정한 키를 self에 저장하여 비교하거나, 매번 호출)
+        if not hasattr(self, '_current_genai_api_key') or self._current_genai_api_key != current_api_key:
+            try:
+                genai.configure(api_key=current_api_key)
+                self._current_genai_api_key = current_api_key
+                masked_key = current_api_key[:6] + "*" * (len(current_api_key) - 6)
+                self.logger.debug(f"Configured GenAI with API key: {masked_key}")
+            except Exception as e:
+                self.logger.error(f"Failed to configure GenAI with API key: {e}")
+                return f"Error: Failed to configure API key."
 
-        # Обновляем клиента, чтобы использовать выбранный API ключ/endpoint
-        self._initialize_client()
-
-        self.logger.debug(f"Current Provider: {provider}")
-        self.logger.debug(f"Using model name for API call: {model_name}")
-
-        if model_name == "gpt3":
-            return self._request_translation_gpt3(prompt)
-        elif model_name in ["gpt35-turbo", "gpt4"]:
-            model_name = model_name.replace("gpt35-turbo", "gpt-3.5-turbo").replace(
-                "gpt4", "gpt-4"
-            )
-
-        if self.debug_mode:
-            self.logger.info(f"Using model: {model_name}, Provider: {provider}")
-
-        if provider == "Google":
-            result = self._request_translation_with_chat_sample_google(
-                prompt, model_name, chat_sample
-            )
-        else:
-            result = self._request_translation_with_chat_sample_openai(
-                prompt, model_name, chat_sample
-            )
+        model_name_from_param = self.override_model or self.model
+        
+        # 모델 클라이언트 재설정 (모델 이름이 변경되었을 수 있으므로)
+        if not self.model_client or self.model_client.model_name != model_name_from_param:
+            try:
+                self.model_client = genai.GenerativeModel(model_name_from_param)
+                self.logger.debug(f"Initialized Gemini model: {model_name_from_param}")
+            except Exception as e:
+                self.logger.error(f"Failed to initialize Gemini model {model_name_from_param}: {e}")
+                return f"Error: Failed to initialize model {model_name_from_param}."
+        
+        result = self._request_translation_with_chat_sample_google(
+            prompt, chat_sample
+        )
 
         if not isinstance(result, str):
             result = str(result)
         return result
 
-    def _request_translation_with_chat_sample_openai(
-        self, prompt: str, model: str, chat_sample: List[str]
-    ) -> str:
-        messages = [
-            {"role": "system", "content": self.chat_system_template},
-            {"role": "user", "content": prompt},
-        ]
-        if chat_sample:
-            messages.insert(1, {"role": "user", "content": chat_sample[0]})
-            messages.insert(2, {"role": "assistant", "content": chat_sample[1]})
-
-        func_args = {
-            "model": model,
-            "messages": messages,
-            "temperature": self.temperature,
-            "top_p": self.top_p,
-            "max_tokens": self.max_tokens // 2,
-            "frequency_penalty": float(self.params["frequency penalty"]["value"]),
-            "presence_penalty": float(self.params["presence penalty"]["value"]),
-        }
-
-        response = self.client.chat.completions.create(**func_args)
-
-        if response.choices:  # Проверка на наличие choices
-            if response.choices[
-                0
-            ].message:  # Проверка на наличие message в первом choice
-                content = response.choices[0].message.content
-                if content is None:  # Проверка на None content
-                    if self.debug_mode:
-                        self.logger.warning("Chat completion content is None.")
-                    return ""  # Возвращаем пустую строку, если content None
-            else:
-                if self.debug_mode:
-                    self.logger.warning("No message found in chat completion choice.")
-                return ""  # Возвращаем пустую строку, если нет message
-        else:
-            if self.debug_mode:
-                self.logger.warning("No choices found in chat completion response.")
-            return ""  # Возвращаем пустую строку, если нет choices
-
-        if response.usage:  # Проверка на наличие usage
-            self.token_count += response.usage.total_tokens
-            self.token_count_last = response.usage.total_tokens
-        else:
-            if self.debug_mode:
-                self.logger.warning("Usage data not found in chat completion response.")
-                self.token_count_last = (
-                    0  # Устанавливаем token_count_last в 0, если usage нет
-                )
-        return content  # Возвращаем content после всех проверок
-
     def _request_translation_with_chat_sample_google(
-        self, prompt: str, model: str, chat_sample: List[str]
+        self, prompt: str, chat_sample: Optional[List[str]]
     ) -> str:
-        messages = [
-            {"role": "system", "content": self.chat_system_template},
-            {"role": "user", "content": prompt},
-        ]
+        if not self.model_client:
+            self.logger.error("Gemini model client is not initialized.")
+            return "Error: Model client not initialized."
+
+        # Gemini API는 messages 대신 contents를 사용하고, role도 user/model로 다름
+        gemini_contents = []
+        
+        # 시스템 프롬프트 추가 (첫 번째 user 메시지에 결합)
+        current_user_prompt_parts = [self.chat_system_template, prompt]
+
         if chat_sample:
-            messages.insert(1, {"role": "user", "content": chat_sample[0]})
-            messages.insert(2, {"role": "assistant", "content": chat_sample[1]})
+            # 샘플 유저 메시지
+            gemini_contents.append({"role": "user", "parts": [{"text": chat_sample[0]}]})
+            # 샘플 모델 응답
+            gemini_contents.append({"role": "model", "parts": [{"text": chat_sample[1]}]})
+        
+        # 실제 번역 요청 프롬프트 (시스템 프롬프트와 결합됨)
+        gemini_contents.append({"role": "user", "parts": [{"text": "\n".join(current_user_prompt_parts)}]})
 
-        func_args = {
-            "model": model,
-            "messages": messages,
-            "top_p": self.top_p,
-            "max_tokens": self.max_tokens // 2,
-        }
 
-        response = self.client.chat.completions.create(**func_args)
-        if response.choices:
-            if response.choices[0].message:
-                return response.choices[0].message.content
-        return ""  # Возвращаем пустую строку, если нет content
+        generation_config = genai.types.GenerationConfig(
+            max_output_tokens=self.max_tokens, # Gemini는 max_output_tokens 사용
+            temperature=self.temperature, 
+            top_p=self.top_p 
+        )
+        
+        safety_settings = [ # 모든 안전 설정을 비활성화 (번역 작업에 불필요)
+            {
+                "category": "HARM_CATEGORY_HARASSMENT",
+                "threshold": "BLOCK_NONE",
+            },
+            {
+                "category": "HARM_CATEGORY_HATE_SPEECH",
+                "threshold": "BLOCK_NONE",
+            },
+            {
+                "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+                "threshold": "BLOCK_NONE",
+            },
+            {
+                "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
+                "threshold": "BLOCK_NONE",
+            },
+        ]
+
+        try:
+            response = self.model_client.generate_content(
+                contents=gemini_contents,
+                generation_config=generation_config,
+                safety_settings=safety_settings
+            )
+        except Exception as e:
+            self.logger.error(f"Gemini API request failed: {e}")
+            self.logger.error(f"Traceback: {traceback.format_exc()}")
+            return f"Error: API request failed - {e}"
+
+
+        if response.candidates and response.candidates[0].content.parts:
+            return response.candidates[0].content.parts[0].text
+        
+        self.logger.warning(f"No content found in Gemini response. Prompt: {prompt[:100]}... Response: {response}")
+        return ""
+
 
     def _translate(self, src_list: List[str]) -> List[str]:
         translations = []
@@ -565,23 +499,27 @@ class LLM_API_Translator(BaseTranslator):
             retry_attempt = 0
             while True:
                 try:
-                    response = self._request_translation(prompt, chat_sample)
-                    if not isinstance(response, str):
-                        response = str(response)
-                    new_translations = re.split(r"<\|\d+\|>", response)[-num_src:]
+                    response_text = self._request_translation(prompt, chat_sample)
+                    if not isinstance(response_text, str):
+                        response_text = str(response_text) # 응답이 문자열이 아닐 경우 변환
+                    
+                    new_translations = re.split(r"<\|\d+\|>", response_text)[-num_src:]
+                    
                     if len(new_translations) != num_src:
-                        _tr2 = re.sub(r"<\|\d+\|>", "", response).split("\n")
+                        # 번역 결과가 예상과 다를 경우, 줄바꿈 기준으로 재분할 시도
+                        _tr2 = re.sub(r"<\|\d+\|>", "", response_text).split("\n")
                         if len(_tr2) == num_src:
                             new_translations = _tr2
                         else:
-                            raise InvalidNumTranslations
-                    break
-                except InvalidNumTranslations:
+                            # 그래도 개수가 맞지 않으면 예외 발생
+                            raise InvalidNumTranslations(f"Expected {num_src} translations, got {len(new_translations)}. Response: '{response_text[:200]}...'")
+                    break 
+                except InvalidNumTranslations as e:
                     retry_attempt += 1
-                    message = f"Translation count mismatch:\nprompt:\n{prompt}\ntranslations:\n{new_translations}\nresponse:\n{response}"
+                    message = f"Translation count mismatch: {e}\nprompt:\n{prompt}\ntranslations:\n{new_translations}\nresponse:\n{response_text}"
                     if retry_attempt >= self.retry_attempts:
                         self.logger.error(message)
-                        new_translations = [""] * num_src
+                        new_translations = [""] * num_src # 실패 시 빈 문자열로 채움
                         break
                     self.logger.warning(
                         message + f"\nRetrying. Attempt: {retry_attempt}"
@@ -589,7 +527,7 @@ class LLM_API_Translator(BaseTranslator):
                 except Exception as e:
                     retry_attempt += 1
                     if retry_attempt >= self.retry_attempts:
-                        new_translations = [""] * num_src
+                        new_translations = [""] * num_src # 실패 시 빈 문자열로 채움
                         break
                     self.logger.warning(
                         f"Translation failed: {e}. Attempt: {retry_attempt}, sleep {self.retry_timeout}s..."
@@ -598,10 +536,9 @@ class LLM_API_Translator(BaseTranslator):
                     time.sleep(self.retry_timeout)
             translations.extend([t.strip() for t in new_translations])
 
-        if self.token_count_last:
-            self.logger.info(
-                f"Used {self.token_count_last} tokens (Total: {self.token_count})"
-            )
+        # Gemini API는 현재 토큰 사용량 정보를 응답에 포함하지 않음
+        # self.logger.info(f"Token count information is not available for Gemini API.")
+
         return translations
 
     def updateParam(self, param_key: str, param_content):
@@ -611,11 +548,10 @@ class LLM_API_Translator(BaseTranslator):
         )
         if param_key in [
             "proxy",
-            "multiple_keys",
             "apikey",
-            "provider",
-            "endpoint",
             "model",
             "override_model",
+            "multiple_keys",
         ]:
             self._initialize_client()
+
