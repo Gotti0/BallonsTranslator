@@ -3,6 +3,8 @@ import time
 import yaml
 import traceback
 from typing import List, Dict, Optional
+import json
+import os
 
 import httpx
 from google import genai # 공식 문서에 따른 import
@@ -113,6 +115,23 @@ class GeminiTranslator(BaseTranslator):
             "description": "Check if running locally and facing VRAM issues.",
             "type": "checkbox",
         },
+        "use_vertex_ai": {
+            "value": False,
+            "description": "Use Vertex AI instead of Gemini Developer API",
+            "type": "checkbox",
+        },
+        "vertex_service_account_file": {
+            "value": "",
+            "description": "Path to Vertex AI service account JSON file. If empty, uses environment variables.",
+        },
+        "vertex_location": {
+            "value": "us-central1",
+            "description": "GCP location for Vertex AI (e.g., us-central1, europe-west1)",
+        },
+        "vertex_project_id": {
+            "value": "",
+            "description": "GCP Project ID for Vertex AI. If empty, auto-extracted from service account file.",
+        },
     }
 
     def _setup_translator(self):
@@ -149,9 +168,65 @@ class GeminiTranslator(BaseTranslator):
         self.minute_start_time = time.time()
         self.key_usage = {}  # {api_key: (count, minute_start_time)}
         self.client = None # Google Gen AI Client
+        # Vertex AI 환경 설정 추가
+        self._setup_vertex_environment()
+
+    def _setup_vertex_environment(self):
+        """Vertex AI 환경 변수 자동 설정"""
+        if not self.get_param_value("use_vertex_ai"):
+            return
+        
+        project_id = self._get_project_id()
+        location = self.get_param_value("vertex_location") or "us-central1"
+        
+        # 환경 변수 설정
+        if project_id:
+            os.environ['GOOGLE_CLOUD_PROJECT'] = project_id
+            os.environ['GOOGLE_CLOUD_LOCATION'] = location
+            # google-genai SDK는 vertexai=True 플래그로 Vertex AI 사용을 명시하므로,
+            # GOOGLE_GENAI_USE_VERTEXAI는 필수는 아닐 수 있습니다.
+            # os.environ['GOOGLE_GENAI_USE_VERTEXAI'] = 'true' 
+            
+            self.logger.debug(f"Set Vertex AI environment variables: PROJECT={project_id}, LOCATION={location}")
+
+    def _load_service_account_info(self) -> Optional[Dict]:
+        """서비스 계정 JSON 파일에서 정보 로드"""
+        service_account_file = self.get_param_value("vertex_service_account_file").strip()
+        
+        if not service_account_file:
+            return None
+        
+        try:
+            from pathlib import Path # pathlib 임포트
+            file_path = Path(service_account_file).expanduser()
+            if not file_path.exists():
+                self.logger.error(f"Service account file not found: {file_path}")
+                return None
+            
+            with open(file_path, 'r', encoding='utf-8') as f:
+                service_account_info = json.load(f)
+            
+            self.logger.debug(f"Loaded service account from: {file_path}")
+            return service_account_info
+            
+        except json.JSONDecodeError as e:
+            self.logger.error(f"Invalid JSON in service account file: {e}")
+            return None
+        except Exception as e:
+            self.logger.error(f"Error loading service account file: {e}")
+            return None
 
     def _ensure_client(self):
-        """새로운 SDK 방식으로 클라이언트 초기화"""
+        """Gemini Developer API 또는 Vertex AI 클라이언트 초기화"""
+        use_vertex = self.get_param_value("use_vertex_ai")
+        
+        if use_vertex:
+            self._ensure_vertex_client()
+        else:
+            self._ensure_gemini_client()
+
+    def _ensure_gemini_client(self):
+        """기존 Gemini Developer API 클라이언트 초기화"""
         current_api_key = self._select_api_key()
         if not current_api_key:
             self.logger.error("No API key available for translation.")
@@ -173,6 +248,276 @@ class GeminiTranslator(BaseTranslator):
             except Exception as e:
                 self.logger.error(f"Failed to initialize client: {e}")
                 self.client = None
+                raise
+
+    def _get_project_id(self) -> Optional[str]:
+        """프로젝트 ID 자동 추출"""
+        # 수동 설정된 프로젝트 ID 우선 사용
+        manual_project_id = self.get_param_value("vertex_project_id").strip()
+        if manual_project_id:
+            return manual_project_id
+        
+        # 서비스 계정 파일에서 추출
+        service_account_info = self._load_service_account_info()
+        if service_account_info and 'project_id' in service_account_info:
+            project_id = service_account_info['project_id']
+            self.logger.info(f"Auto-extracted project ID: {project_id}")
+            return project_id
+        
+        # 환경 변수에서 확인 (GOOGLE_CLOUD_PROJECT는 _setup_vertex_environment에서 설정될 수 있음)
+        env_project = os.environ.get('GOOGLE_CLOUD_PROJECT')
+        if env_project:
+            self.logger.info(f"Using project ID from environment: {env_project}")
+            return env_project
+        
+        return None
+
+    def _ensure_vertex_client(self):
+        """Vertex AI 클라이언트 초기화"""
+        project_id = self._get_project_id()
+        if not project_id:
+            self.logger.error("No project ID available for Vertex AI")
+            raise ValueError("No project ID available for Vertex AI")
+        
+        location = self.get_param_value("vertex_location") or "us-central1"
+        service_account_file = self.get_param_value("vertex_service_account_file").strip()
+        
+        try:
+            # 서비스 계정 파일 설정
+            if service_account_file:
+                from pathlib import Path # pathlib 임포트
+                file_path = Path(service_account_file).expanduser()
+                if file_path.exists():
+                    os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = str(file_path)
+                    self.logger.debug(f"Set GOOGLE_APPLICATION_CREDENTIALS: {file_path}")
+                else:
+                    self.logger.warning(f"Service account file not found: {file_path}, will try default credentials.")
+            
+            # Vertex AI 클라이언트 생성
+            self.client = genai.Client(
+                project=project_id, # project_id 대신 project 사용
+                location=location,
+                # vertexai=True, # google-genai 에서는 project, location 지정 시 자동으로 Vertex AI 사용
+            )
+            
+            self.logger.info(f"Initialized Vertex AI client for project: {project_id}, location: {location}")
+            
+        except Exception as e:
+            self.logger.error(f"Failed to initialize Vertex AI client: {e}")
+            self.client = None
+            raise
+
+    @property
+    def use_vertex_ai(self) -> bool:
+        return bool(self.get_param_value("use_vertex_ai"))
+
+    @property
+    def vertex_location(self) -> str:
+        return self.get_param_value("vertex_location") or "us-central1"
+
+    @property
+    def vertex_project_id(self) -> Optional[str]:
+        return self.get_param_value("vertex_project_id").strip() or None
+
+    @property
+    def vertex_service_account_file(self) -> Optional[str]:
+        return self.get_param_value("vertex_service_account_file").strip() or None
+
+    def get_param_value(self, key: str) -> any:
+        """Helper to get param value, considering dict structure."""
+        param = self.params.get(key)
+        if isinstance(param, dict):
+            return param.get("value")
+        return param # Direct value if not a dict (e.g. for older param structures)
+
+    def _select_api_key(self) -> str:
+        api_keys = self.multiple_keys_list
+        if not api_keys:
+            return self.apikey # 단일 키 사용
+
+        # 여러 키가 있는 경우 로테이션
+        selected_key = None
+        for _ in range(len(api_keys)): # 모든 키를 한 번씩 확인
+            index = self.current_key_index % len(api_keys)
+            key_to_check = api_keys[index]
+            
+            count, start_time = self.key_usage.get(key_to_check, (0, time.time()))
+            now = time.time()
+            rpm_limit = int(self.get_param_value("max requests per minute"))
+
+            if now - start_time >= 60: # 1분이 지났으면 리셋
+                self.key_usage[key_to_check] = (0, now)
+                count = 0
+            
+            if rpm_limit <= 0 or count < rpm_limit: # RPM 제한이 없거나, 아직 여유가 있으면
+                selected_key = key_to_check
+                self.key_usage[selected_key] = (count + 1, start_time if now - start_time < 60 else now)
+                self.current_key_index = (index + 1) % len(api_keys) # 다음 요청을 위해 인덱스 이동
+                break
+            
+            self.current_key_index = (index + 1) % len(api_keys) # 다음 키로 넘어감
+
+        if not selected_key: # 모든 키가 RPM 제한에 도달한 경우
+            # 가장 오래전에 사용된 (또는 곧 리셋될) 키를 선택하고 대기
+            # 간단하게 첫 번째 키를 선택하고 _respect_key_limit에서 대기하도록 함
+            selected_key = api_keys[self.current_key_index % len(api_keys)]
+            self._respect_key_limit(selected_key) # 여기서 대기 발생
+            count, start_time = self.key_usage.get(selected_key, (0, time.time()))
+            self.key_usage[selected_key] = (count + 1, start_time) # 사용량 업데이트
+            self.current_key_index = (self.current_key_index + 1) % len(api_keys)
+
+        return selected_key
+
+    def _respect_key_limit(self, key: str):
+        rpm = int(self.get_param_value("max requests per minute"))
+        if rpm <= 0:
+            return
+        
+        count, start_time = self.key_usage.get(key, (0, time.time()))
+        now = time.time()
+
+        if now - start_time >= 60:
+            self.key_usage[key] = (0, now) # 분이 지났으면 카운트 리셋
+            count = 0 # 아래 로직에서 사용하기 위해 업데이트
+        
+        if count >= rpm:
+            wait_time = 60.1 - (now - start_time) # 약간의 버퍼 추가
+            masked_key = key[:6] + "*" * (len(key) - 6)
+            self.logger.warning(
+                f"Key {masked_key} reached RPM limit ({rpm}). Waiting {wait_time:.2f} seconds."
+            )
+            if wait_time > 0:
+                time.sleep(wait_time)
+            self.key_usage[key] = (0, time.time()) # 대기 후 카운트 리셋
+
+    def _respect_delay(self):
+        current_time = time.time()
+        # Global RPM limit (if any, though individual key limits are primary)
+        # This part can be simplified if key-specific RPM is the main concern.
+        # For now, keeping a global check as a fallback or for overall rate control.
+        global_rpm_limit = int(self.get_param_value("max requests per minute")) # Assuming this is a global limit if no multiple keys
+
+        if global_rpm_limit > 0 and not self.multiple_keys_list: # Only apply if single key or as a general cap
+            if current_time - self.minute_start_time >= 60:
+                self.request_count_minute = 0
+                self.minute_start_time = current_time
+
+            if self.request_count_minute >= global_rpm_limit:
+                wait_time = 60.1 - (current_time - self.minute_start_time)
+                if wait_time > 0:
+                    self.logger.warning(
+                        f"Reached global RPM limit ({global_rpm_limit}). Waiting {wait_time:.2f} seconds."
+                    )
+                    time.sleep(wait_time)
+                self.request_count_minute = 0
+                self.minute_start_time = time.time()
+
+        time_since_last_request = current_time - self.last_request_time
+        delay = float(self.get_param_value("delay"))
+        if time_since_last_request < delay:
+            sleep_time = delay - time_since_last_request
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+
+        self.last_request_time = time.time()
+        if not self.multiple_keys_list: # Only increment global counter if not using multiple keys (key-specific handles it)
+            self.request_count_minute += 1
+
+    def _request_translation(self, prompt: str, chat_sample: Optional[List[str]]) -> str:
+        self._respect_delay() # Global delay
+
+        # Select key and respect its limit BEFORE making the call
+        if not self.use_vertex_ai: # Vertex AI uses service account, not API keys in this way
+            api_key = self._select_api_key()
+            if not api_key:
+                return "Error: No API key available."
+            self._respect_key_limit(api_key) # Respect key-specific RPM
+        
+        try:
+            self._ensure_client()
+        except ValueError as ve:
+            return str(ve)
+        except Exception as e:
+            self.logger.error(f"Error during client initialization: {e}")
+            return f"Error: Client initialization failed - {e}"
+
+        result = self._request_translation_with_chat_sample_google(prompt, chat_sample)
+        if not isinstance(result, str):
+            result = str(result)
+        return result
+
+    def _translate(self, src_list: List[str]) -> List[str]:
+        translations = []
+        to_lang = self.lang_map[self.lang_target]
+        queries = src_list
+        chat_sample = self.chat_sample
+
+        for prompt, num_src in self._assemble_prompts(queries, to_lang=to_lang):
+            retry_attempt = 0
+            while True:
+                try:
+                    response_text = self._request_translation(prompt, chat_sample)
+                    if not isinstance(response_text, str):
+                        response_text = str(response_text) # 응답이 문자열이 아닐 경우 변환
+                    
+                    new_translations = re.split(r"<\|\d+\|>", response_text)[-num_src:]
+                    
+                    if len(new_translations) != num_src:
+                        # 번역 결과가 예상과 다를 경우, 줄바꿈 기준으로 재분할 시도
+                        _tr2 = re.sub(r"<\|\d+\|>", "", response_text).split("\n")
+                        if len(_tr2) == num_src:
+                            new_translations = _tr2
+                        else:
+                            # 그래도 개수가 맞지 않으면 예외 발생
+                            raise InvalidNumTranslations(f"Expected {num_src} translations, got {len(new_translations)}. Response: '{response_text[:200]}...'")
+                    break 
+                except InvalidNumTranslations as e:
+                    retry_attempt += 1
+                    message = f"Translation count mismatch: {e}\nprompt:\n{prompt}\ntranslations:\n{new_translations}\nresponse:\n{response_text}"
+                    if retry_attempt >= self.retry_attempts:
+                        self.logger.error(message)
+                        new_translations = [""] * num_src # 실패 시 빈 문자열로 채움
+                        break
+                    self.logger.warning(
+                        message + f"\nRetrying. Attempt: {retry_attempt}"
+                    )
+                except Exception as e:
+                    retry_attempt += 1
+                    if retry_attempt >= self.retry_attempts:
+                        new_translations = [""] * num_src # 실패 시 빈 문자열로 채움
+                        break
+                    self.logger.warning(
+                        f"Translation failed: {e}. Attempt: {retry_attempt}, sleep {self.retry_timeout}s..."
+                    )
+                    self.logger.error(f"Traceback: {traceback.format_exc()}")
+                    time.sleep(self.retry_timeout)
+            translations.extend([t.strip() for t in new_translations])
+
+        # Gemini API는 현재 토큰 사용량 정보를 응답에 포함하지 않음
+        # self.logger.info(f"Token count information is not available for Gemini API.")
+
+        return translations
+
+    def updateParam(self, param_key: str, param_content):
+        super().updateParam(param_key, param_content)
+        self.logger.debug(
+            f"updateParam called for key: {param_key}, content: {param_content}"
+        )
+        if param_key in [
+            "apikey",
+            "multiple_keys", 
+            "use_vertex_ai",
+            "vertex_service_account_file",
+            "vertex_location",
+            "vertex_project_id",
+            "model",
+            "override_model",
+            "proxy", # 프록시 변경 시 클라이언트 재설정 (환경 변수 외 명시적 설정 시)
+        ]:
+            self.client = None # 클라이언트 재초기화 플래그
+            self.logger.debug(f"Client reset due to parameter change: {param_key}")
+            if param_key in ["use_vertex_ai", "vertex_service_account_file", "vertex_location", "vertex_project_id"]:
+                self._setup_vertex_environment() # Vertex AI 관련 환경변수 재설정
                 raise
 
     @property
