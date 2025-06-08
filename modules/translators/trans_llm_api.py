@@ -498,6 +498,30 @@ class GeminiTranslator(BaseTranslator):
         # self.logger.info(f"Token count information is not available for Gemini API.")
 
         return translations
+    
+    def _translate_single_block(self, text_block: str, to_lang: str, chat_sample: Optional[List[str]]) -> str:
+        """단일 텍스트 블록을 번역합니다."""
+        # 단일 블록에 대한 프롬프트 생성 (기존 _assemble_prompts 로직 간소화)
+        prompt_template = (
+            self.params["prompt template"]["value"].format(to_lang=to_lang).rstrip()
+        )
+        prompt = f"{prompt_template}\n<|1|>{text_block}"
+        
+        retry_attempt = 0
+        while retry_attempt < self.retry_attempts:
+            try:
+                response_text = self._request_translation(prompt, chat_sample)
+                if not isinstance(response_text, str):
+                    response_text = str(response_text)
+                # 단일 블록이므로, 응답에서 구분자 파싱 없이 바로 사용 (또는 간단한 정리)
+                # <|1|> 응답 형식을 따른다면, 해당 부분만 추출
+                match = re.search(r"<\|1\|>(.*)", response_text, re.DOTALL)
+                return match.group(1).strip() if match else response_text.strip()
+            except Exception as e:
+                retry_attempt += 1
+                self.logger.warning(f"Single block translation failed for '{text_block[:30]}...': {e}. Attempt: {retry_attempt}")
+                time.sleep(self.retry_timeout)
+        return "" # 모든 재시도 실패 시 빈 문자열 반환
 
     def updateParam(self, param_key: str, param_content):
         super().updateParam(param_key, param_content)
@@ -868,6 +892,23 @@ class GeminiTranslator(BaseTranslator):
                     self.logger.error(f"Traceback: {traceback.format_exc()}")
                     time.sleep(self.retry_timeout)
             translations.extend([t.strip() for t in new_translations])
+            
+            # 특정 예외 발생 시 문장 단위 번역 시도
+            except Exception as e:
+                # 예외 메시지 또는 타입에 따라 특정 오류인지 확인
+                if "PROHIBITED_CONTENT" in str(e).upper() or "PROHIBITED" in str(e).upper() or "INTERNAL" in str(e).upper() or "OTHER" in str(e).upper() : # 실제 예외 조건으로 수정
+                    self.logger.warning(f"Page-level translation failed with specific error: {e}. Attempting block-by-block translation for this chunk.")
+                    # 현재 청크(prompt에 포함된 queries)를 개별적으로 번역
+                    # num_src를 사용하여 원래 queries의 해당 부분을 가져와야 함
+                    # queries는 전체 src_list이고, 현재 prompt는 queries의 일부일 수 있음
+                    # 이 예제에서는 현재 prompt에 포함된 텍스트들을 다시 분리하여 시도한다고 가정
+                    # 실제로는 _assemble_prompts에서 사용된 queries의 해당 부분을 가져와야 함
+                    # 여기서는 단순화를 위해 prompt에서 <|id|> 태그로 분리된 텍스트를 사용
+                    original_texts_in_prompt = [text_part.split('>', 1)[1] for text_part in prompt.splitlines() if text_part.startswith("<|")]
+                    
+                    chunk_translations = [self._translate_single_block(text, to_lang, chat_sample) for text in original_texts_in_prompt]
+                    translations.extend(chunk_translations) # 개별 번역된 결과를 전체 결과에 추가
+                    break # 현재 프롬프트(청크)에 대한 루프 종료
 
         # Gemini API는 현재 토큰 사용량 정보를 응답에 포함하지 않음
         # self.logger.info(f"Token count information is not available for Gemini API.")
