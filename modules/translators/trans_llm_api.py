@@ -613,26 +613,7 @@ class GeminiTranslator(BaseTranslator):
             )
         return "\n".join(["System:", self.chat_system_template, "User Prompt:", prompt])
 
-    def _respect_delay(self):
-        # This method is now mostly for the global delay.
-        # Key-specific RPM is handled in _respect_key_limit.
-        # Global RPM for single key scenario is also handled there.
-        # If multiple_keys_list is empty, it means we are using a single key,
-        # and its RPM is managed by _respect_key_limit.
-        # So, the global RPM logic here can be simplified or removed if
-        # _respect_key_limit correctly handles the single key case.
-
-        time_since_last_request = current_time - self.last_request_time
-        current_time = time.time() # Define current_time here
-
-        delay = float(self.get_param_value("delay"))
-        if time_since_last_request < delay:
-            sleep_time = delay - time_since_last_request
-            time.sleep(sleep_time)
-
-        self.last_request_time = time.time()
-        if not self.multiple_keys_list: # Only increment global counter if using a single key
-            self.request_count_minute += 1
+    
 
     def _respect_key_limit(self, key: str):
         rpm = int(self.get_param_value("max requests per minute"))
@@ -785,7 +766,7 @@ class GeminiTranslator(BaseTranslator):
             response = self.client.models.generate_content(
                 model=model_name,
                 contents=contents,
-                generation_config=config # generate_content는 generation_config를 받음
+                config=config 
             )
         except Exception as e:
             self.logger.error(f"Gemini API request failed: {e}")
@@ -807,18 +788,24 @@ class GeminiTranslator(BaseTranslator):
 
 
     def _translate(self, src_list: List[str]) -> List[str]:
-        translations = []
+        num_queries = len(src_list)
+
         if not src_list:
             return []
+        
+        translations = [""] * num_queries # Initialize with correct size
 
-        to_lang = self.lang_map.get(self.lang_target, self.lang_target)
+        to_lang = self.lang_map.get(self.lang_target, self.lang_target) 
         chat_sample = self.chat_sample
         prompt_template_base = self.params["prompt template"]["value"].format(to_lang=to_lang).rstrip()
 
         def translate_single_query_thread_safe(query_idx_pair):
             idx, query_text = query_idx_pair
             if not query_text.strip(): # 빈 문자열은 번역하지 않음
-                translations[idx] = ""
+                if 0 <= idx < num_queries:
+                    translations[idx] = ""
+                else:
+                    self.logger.error(f"Critical Error: Index {idx} out of bounds for translations list of size {num_queries} (empty query).")
                 return
 
             # 각 쿼리에 대한 프롬프트 생성
@@ -854,28 +841,44 @@ class GeminiTranslator(BaseTranslator):
                     if not translated_text and query_text: # 번역 결과가 비었으면 오류로 간주 (필요시 원본 사용)
                         raise InvalidNumTranslations(f"Empty translation for query: {query_text}")
 
-                    translations[idx] = translated_text
+                    if 0 <= idx < num_queries:
+                        translations[idx] = translated_text
+                    else:
+                        self.logger.error(f"Critical Error: Index {idx} out of bounds for translations list of size {num_queries} (success case).")
                     return
                 except InvalidNumTranslations as e:
                     retry_attempt += 1
                     self.logger.warning(f"Invalid translation for query '{query_text[:30]}...': {e}. Attempt {retry_attempt}/{self.retry_attempts}")
                     if retry_attempt >= self.retry_attempts:
-                        translations[idx] = f"[번역 오류: 내용 없음]"
+                        if 0 <= idx < num_queries:
+                            translations[idx] = f"[번역 오류: 내용 없음]"
+                        else:
+                            self.logger.error(f"Critical Error: Index {idx} out of bounds for translations list of size {num_queries} (InvalidNumTranslations fallback).")
                         return
                 except Exception as e:
                     retry_attempt += 1
                     self.logger.warning(f"Error translating query '{query_text[:30]}...': {e}. Attempt {retry_attempt}/{self.retry_attempts}")
                     if retry_attempt >= self.retry_attempts:
-                        translations[idx] = f"[번역 오류: {str(e)[:30]}]"
+                        if 0 <= idx < num_queries: # Check bounds before assignment
+                            translations[idx] = f"[번역 오류: {str(e)[:30]}]"
+                        else:
+                            # This case should ideally not be reached if idx is always correct.
+                            # Logging it helps diagnose if idx is somehow corrupted.
+                            self.logger.error(f"Critical Error: Index {idx} out of bounds for translations list of size {num_queries} (Exception fallback).")
                         return
                     time.sleep(self.retry_timeout)
-            translations[idx] = "[번역 실패]" # 최종 실패
+            
+            if 0 <= idx < num_queries: # Default fallback after retries
+                translations[idx] = "[번역 실패]"
+            else:
+                self.logger.error(f"Critical Error: Index {idx} out of bounds for translations list of size {num_queries} (final fallback).")
 
         # ThreadPoolExecutor 설정
         num_keys = len(self.multiple_keys_list) if self.multiple_keys_list else 1
         rpm_per_key = int(self.get_param_value("max requests per minute"))
         
         # 워커 수 결정 로직: RPM이 매우 낮으면 병렬성 줄임, 아니면 키 개수만큼 (최대치 제한)
+        # Ensure max_workers is at least 1
         if rpm_per_key <= 0: # 제한 없음
             max_workers = min(num_keys * 2, 10) # 키당 2개, 최대 10개 (임의의 값)
         elif rpm_per_key < 15: # 낮은 RPM
@@ -885,12 +888,16 @@ class GeminiTranslator(BaseTranslator):
         else: # 높은 RPM
             max_workers = min(num_keys, 10) # 키 개수만큼 하되 최대 10개
 
-        if self.use_vertex_ai: # Vertex AI는 일반적으로 더 높은 처리량을 가짐
-            max_workers = rpm_per_key / 2
+        if self.use_vertex_ai and rpm_per_key > 0: # Vertex AI는 일반적으로 더 높은 처리량을 가짐
+            max_workers = max(1, int(rpm_per_key / 2)) # Ensure at least 1 worker
+        
+        max_workers = max(1, max_workers) # Globally ensure at least 1 worker
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # list(zip(range(len(src_list)), src_list)) -> [(0, query1), (1, query2), ...]
-            future_to_idx = {executor.submit(translate_single_query_thread_safe, pair): pair[0] for pair in zip(range(len(src_list)), src_list)}
+            # Use num_queries (captured length) for range
+            pairs = list(zip(range(num_queries), src_list))
+            future_to_idx = {executor.submit(translate_single_query_thread_safe, pair): pair[0] 
+                             for pair in pairs}
             
             for future in concurrent.futures.as_completed(future_to_idx):
                 idx = future_to_idx[future]
@@ -898,8 +905,10 @@ class GeminiTranslator(BaseTranslator):
                     future.result() # 예외가 발생했다면 여기서 다시 발생 (이미 내부에서 로깅 및 처리)
                 except Exception as exc:
                     self.logger.error(f'Query (idx {idx}) translation generated an exception: {exc}')
-                    if translations[idx] == "": # 아직 오류 메시지가 설정되지 않았다면
+                    if 0 <= idx < num_queries and translations[idx] == "": # 아직 오류 메시지가 설정되지 않았다면
                         translations[idx] = "[번역 중 예외 발생]"
+                    elif not (0 <= idx < num_queries):
+                        self.logger.error(f"Critical Error: Index {idx} out of bounds for translations list of size {num_queries} (as_completed fallback).")
 
         # Gemini API는 현재 토큰 사용량 정보를 응답에 포함하지 않음
         # self.logger.info(f"Token count information is not available for Gemini API.")
