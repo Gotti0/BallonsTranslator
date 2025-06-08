@@ -298,7 +298,7 @@ class GeminiTranslator(BaseTranslator):
             self.client = genai.Client(
                 project=project_id, # project_id 대신 project 사용
                 location=location,
-                # vertexai=True, # google-genai 에서는 project, location 지정 시 자동으로 Vertex AI 사용
+                vertexai=True,
             )
             
             self.logger.info(f"Initialized Vertex AI client for project: {project_id}, location: {location}")
