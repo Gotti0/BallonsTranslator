@@ -886,7 +886,7 @@ class GeminiTranslator(BaseTranslator):
             max_workers = min(num_keys, 10) # 키 개수만큼 하되 최대 10개
 
         if self.use_vertex_ai: # Vertex AI는 일반적으로 더 높은 처리량을 가짐
-            max_workers = min(num_keys if num_keys > 1 else 2, 10) # 서비스 계정은 하나일 수 있으므로 최소 2, 최대 10
+            max_workers = rpm_per_key / 2
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             # list(zip(range(len(src_list)), src_list)) -> [(0, query1), (1, query2), ...]
