@@ -1019,12 +1019,12 @@ class GeminiTranslator(BaseTranslator):
                     if not isinstance(response_text, str):
                         response_text = str(response_text) # 응답이 문자열이 아닐 경우 변환
                     
-                    new_translations = re.split(r"<\|\d+\|>", response_text)[-num_src:]
+                    new_translations = re.split(r"<\|\d+\|>", response_text)[-num_src_in_chunk:]
                     
-                    if len(new_translations) != num_src:
+                    if len(new_translations) != num_src_in_chunk:
                         # 번역 결과가 예상과 다를 경우, 줄바꿈 기준으로 재분할 시도
                         _tr2 = re.sub(r"<\|\d+\|>", "", response_text).split("\n")
-                        if len(_tr2) == num_src:
+                        if len(_tr2) == num_src_in_chunk:
                             new_translations = _tr2
                         else:
                             # 그래도 개수가 맞지 않으면 예외 발생
