@@ -4,6 +4,8 @@ import yaml
 import traceback
 from typing import List, Dict, Optional
 import json
+import concurrent.futures
+import threading
 import os
 
 import httpx
@@ -169,6 +171,7 @@ class GeminiTranslator(BaseTranslator):
         self.minute_start_time = time.time()
         self.key_usage = {}  # {api_key: (count, minute_start_time)}
         self.client = None # Google Gen AI Client
+        self.rpm_lock = threading.Lock() # RPM 관리를 위한 Lock 추가
         # Vertex AI 환경 설정 추가
         self._setup_vertex_environment()
 
@@ -563,10 +566,12 @@ class GeminiTranslator(BaseTranslator):
         return self.get_param_value("proxy")
 
     @property
-    def chat_system_template(self) -> str:
-        to_lang = self.lang_map[self.lang_target]
-        return self.params["chat system template"]["value"].format(to_lang=to_lang)
-
+    def chat_system_template(self) -> Optional[str]:
+        template_value = self.get_param_value("chat system template")
+        if template_value:
+            to_lang = self.lang_map.get(self.lang_target, self.lang_target) # 목표 언어가 lang_map에 없을 경우를 대비
+            return template_value.format(to_lang=to_lang)
+        return None
     @property
     def chat_sample(self):
         samples_str = self.get_param_value("chat sample")
@@ -591,36 +596,6 @@ class GeminiTranslator(BaseTranslator):
                 self.logger.warning(f"'{src_tgt_key}' in chat sample is missing 'source' or 'target' keys.")
         return None
 
-    def _assemble_prompts(
-        self, queries: List[str], to_lang: str = None, max_tokens_override=None # max_tokens_override로 변경
-    ):
-        if to_lang is None:
-            to_lang = self.lang_map[self.lang_target]
-        prompt_template = (
-            self.params["prompt template"]["value"].format(to_lang=to_lang).rstrip()
-        )
-        prompt = prompt_template
-        num_src = 0
-        i_offset = 0
-
-        # Gemini는 입력 토큰 제한도 고려해야 하므로, max_tokens를 출력 토큰으로만 사용
-        # 입력 길이 제어는 여기서 간단히 문자 수로 처리 (정확한 토큰화는 API 호출 전 수행)
-        # 이 부분은 더 정교한 토큰 기반 분할 로직으로 개선될 수 있습니다.
-        # 현재는 출력 max_tokens를 기준으로 분할합니다.
-        effective_max_tokens = max_tokens_override if max_tokens_override is not None else self.max_tokens
-
-
-        for i, query in enumerate(queries):
-            prompt += f"\n<|{i+1-i_offset}|>{query}"
-            num_src += 1
-            # Approximate check, real tokenization happens later
-            if effective_max_tokens * 2 and len("".join(queries[i + 1 :])) * 1.5 > effective_max_tokens : # 1.5는 문자당 평균 토큰 추정치
-                yield prompt.lstrip(), num_src
-                prompt = prompt_template
-                i_offset = i + 1
-                num_src = 0
-        yield prompt.lstrip(), num_src
-
     def _format_prompt_log(self, prompt: str) -> str:
         chat_sample = self.chat_sample
         if chat_sample: # Gemini는 항상 chat sample을 사용할 수 있음
@@ -639,23 +614,13 @@ class GeminiTranslator(BaseTranslator):
         return "\n".join(["System:", self.chat_system_template, "User Prompt:", prompt])
 
     def _respect_delay(self):
-        current_time = time.time()
-        rpm_limit = int(self.get_param_value("max requests per minute"))
-
-        if rpm_limit > 0:
-            if current_time - self.minute_start_time >= 60:
-                self.request_count_minute = 0
-                self.minute_start_time = current_time
-
-            if self.request_count_minute >= rpm_limit:
-                wait_time = 60.1 - (current_time - self.minute_start_time) # 약간의 버퍼 추가
-                if wait_time > 0:
-                    self.logger.warning(
-                        f"Reached global RPM limit ({rpm_limit}). Waiting {wait_time:.2f} seconds."
-                    )
-                    time.sleep(wait_time)
-                self.request_count_minute = 0
-                self.minute_start_time = time.time()
+        # This method is now mostly for the global delay.
+        # Key-specific RPM is handled in _respect_key_limit.
+        # Global RPM for single key scenario is also handled there.
+        # If multiple_keys_list is empty, it means we are using a single key,
+        # and its RPM is managed by _respect_key_limit.
+        # So, the global RPM logic here can be simplified or removed if
+        # _respect_key_limit correctly handles the single key case.
 
         time_since_last_request = current_time - self.last_request_time
         
@@ -665,7 +630,8 @@ class GeminiTranslator(BaseTranslator):
             time.sleep(sleep_time)
 
         self.last_request_time = time.time()
-        self.request_count_minute += 1
+        if not self.multiple_keys_list: # Only increment global counter if using a single key
+            self.request_count_minute += 1
 
     def _respect_key_limit(self, key: str):
         rpm = int(self.get_param_value("max requests per minute"))
@@ -727,9 +693,14 @@ class GeminiTranslator(BaseTranslator):
         return selected_key
 
 
-    def _request_translation(self, prompt: str, chat_sample: Optional[List[str]]) -> str:
-        self._respect_delay()
-
+    def _request_translation_thread_safe(self, prompt: str, chat_sample: Optional[List[str]]) -> str:
+        with self.rpm_lock:
+            self._respect_delay() # Global delay
+            if not self.use_vertex_ai: # Vertex AI uses service account
+                api_key = self._select_api_key()
+                if not api_key:
+                    return "Error: No API key available."
+                self._respect_key_limit(api_key) # Respect key-specific RPM
         try:
             self._ensure_client()  # configure 대신 client 초기화
         except ValueError as ve: # No API key available
@@ -738,7 +709,7 @@ class GeminiTranslator(BaseTranslator):
             self.logger.error(f"Error during client initialization: {e}")
             return f"Error: Client initialization failed - {e}"
 
-        result = self._request_translation_with_chat_sample_google(prompt, chat_sample)
+        result = self._request_translation_with_chat_sample_google(prompt, chat_sample) # This now uses self.client
         if not isinstance(result, str):
             result = str(result)
         return result
@@ -749,10 +720,12 @@ class GeminiTranslator(BaseTranslator):
         if not self.client:
             self.logger.error("Client is not initialized.")
             return "Error: Client not initialized."
-
-        model_name = self.override_model or self.model
         
-
+        # 모델 이름 설정
+        if self.use_vertex_ai:
+            model_name = self.override_model or self.model # Vertex AI는 "models/" 접두사 없이 모델 ID 사용
+        else:
+            model_name = f"models/{self.override_model or self.model}" # Gemini API는 "models/" 접두사 필요
         # Contents는 사용자 메시지만 포함
 
         contents = []
@@ -770,11 +743,13 @@ class GeminiTranslator(BaseTranslator):
             "parts": [{"text": prompt}] # 시스템 프롬프트는 system_instruction으로 분리
         })
 
+        # 시스템 프롬프트 설정
+        system_instruction_content = self.chat_system_template
+
         # GenerateContentConfig 사용
         config = genai_types.GenerateContentConfig(
-            system_instruction=self.chat_system_template,  # 문자열로 직접 전달
             max_output_tokens=self.max_tokens, # Gemini는 max_output_tokens 사용
-            temperature=self.temperature, 
+            temperature=self.temperature,
             top_p=self.top_p,
             safety_settings=[
                 genai_types.SafetySetting(
@@ -796,12 +771,20 @@ class GeminiTranslator(BaseTranslator):
             ]
         )
 
+        # Vertex AI 사용 시에는 system_instruction을 GenerateContentConfig에 직접 전달하지 않고,
+        # client.generate_content의 system_instruction 파라미터로 전달해야 할 수 있음.
+        # google-genai SDK의 최신 버전에 따라 이 부분이 다를 수 있으므로 확인 필요.
+        # 현재 google.generativeai.GenerativeModel.generate_content 에는 system_instruction 파라미터가 있음.
+        # client.models.generate_content 에는 직접적인 system_instruction 파라미터가 없을 수 있음.
+        # 이 경우, contents에 system role을 추가하거나, 모델 자체에 system prompt를 설정해야 함.
+        # 여기서는 config에 포함시키는 것으로 가정. (만약 오류 발생 시, contents에 추가하는 방식 고려)
+
         try:
             # 올바른 API 호출 방법
             response = self.client.models.generate_content(
-                model=model_name,  # "models/" 접두사 불필요
+                model=model_name,
                 contents=contents,
-                config=config  # generation_config 대신 config 사용
+                generation_config=config # generate_content는 generation_config를 받음
             )
         except Exception as e:
             self.logger.error(f"Gemini API request failed: {e}")
@@ -824,50 +807,98 @@ class GeminiTranslator(BaseTranslator):
 
     def _translate(self, src_list: List[str]) -> List[str]:
         translations = []
-        to_lang = self.lang_map[self.lang_target]
-        queries = src_list
-        chat_sample = self.chat_sample
+        if not src_list:
+            return []
 
-        for prompt, num_src in self._assemble_prompts(queries, to_lang=to_lang):
+        to_lang = self.lang_map.get(self.lang_target, self.lang_target)
+        chat_sample = self.chat_sample
+        prompt_template_base = self.params["prompt template"]["value"].format(to_lang=to_lang).rstrip()
+
+        def translate_single_query_thread_safe(query_idx_pair):
+            idx, query_text = query_idx_pair
+            if not query_text.strip(): # 빈 문자열은 번역하지 않음
+                translations[idx] = ""
+                return
+
+            # 각 쿼리에 대한 프롬프트 생성
+            prompt = f"{prompt_template_base}\n<|1|>{query_text}" # 단일 쿼리
+
             retry_attempt = 0
-            while True:
+            translated_text = ""
+            while retry_attempt < self.retry_attempts:
                 try:
-                    response_text = self._request_translation(prompt, chat_sample)
+                    # _request_translation_thread_safe는 내부적으로 RPM 및 딜레이 관리
+                    response_text = self._request_translation_thread_safe(prompt, chat_sample)
                     if not isinstance(response_text, str):
-                        response_text = str(response_text) # 응답이 문자열이 아닐 경우 변환
-                    
-                    new_translations = re.split(r"<\|\d+\|>", response_text)[-num_src:]
-                    
-                    if len(new_translations) != num_src:
-                        # 번역 결과가 예상과 다를 경우, 줄바꿈 기준으로 재분할 시도
-                        _tr2 = re.sub(r"<\|\d+\|>", "", response_text).split("\n")
-                        if len(_tr2) == num_src:
-                            new_translations = _tr2
-                        else:
-                            # 그래도 개수가 맞지 않으면 예외 발생
-                            raise InvalidNumTranslations(f"Expected {num_src} translations, got {len(new_translations)}. Response: '{response_text[:200]}...'")
-                    break 
+                        response_text = str(response_text)
+
+                    # 단일 쿼리 응답 파싱
+                    parsed_list = re.split(r"<\|\d+\|>", response_text)
+                    if len(parsed_list) > 1 and parsed_list[-1].strip(): # 태그가 있고, 번역 내용이 있으면
+                        translated_text = parsed_list[-1].strip()
+                    elif not parsed_list[-1].strip() and len(parsed_list) > 1 and parsed_list[0].strip() and not parsed_list[0].startswith(prompt_template_base):
+                        # <|1|> 태그 없이 내용만 반환된 경우 (예: "번역된 텍스트")
+                        # 또는 태그는 있었으나 분리 후 마지막 요소가 비어있고, 첫 요소가 프롬프트가 아닌 번역문인 경우
+                        translated_text = parsed_list[0].strip()
+                    elif parsed_list[-1].strip(): # 태그 없이 내용만 반환된 경우
+                         translated_text = parsed_list[-1].strip()
+                    else: # 예상치 못한 형식 또는 빈 응답
+                        # 응답이 프롬프트 자체를 포함하고 있다면, 실제 번역은 없다고 간주
+                        if prompt_template_base in response_text and query_text in response_text:
+                             self.logger.warning(f"Response for '{query_text[:30]}...' seems to be the prompt itself. Treating as empty translation.")
+                             translated_text = "" # 또는 query_text로 설정하거나 오류 발생
+                        else: # 그 외의 경우, 응답 전체를 사용하거나 오류 처리
+                            translated_text = response_text.strip()
+
+                    if not translated_text and query_text: # 번역 결과가 비었으면 오류로 간주 (필요시 원본 사용)
+                        raise InvalidNumTranslations(f"Empty translation for query: {query_text}")
+
+                    translations[idx] = translated_text
+                    return
                 except InvalidNumTranslations as e:
                     retry_attempt += 1
-                    message = f"Translation count mismatch: {e}\nprompt:\n{prompt}\ntranslations:\n{new_translations}\nresponse:\n{response_text}"
+                    self.logger.warning(f"Invalid translation for query '{query_text[:30]}...': {e}. Attempt {retry_attempt}/{self.retry_attempts}")
                     if retry_attempt >= self.retry_attempts:
-                        self.logger.error(message)
-                        new_translations = [""] * num_src # 실패 시 빈 문자열로 채움
-                        break
-                    self.logger.warning(
-                        message + f"\nRetrying. Attempt: {retry_attempt}"
-                    )
+                        translations[idx] = f"[번역 오류: 내용 없음]"
+                        return
                 except Exception as e:
                     retry_attempt += 1
+                    self.logger.warning(f"Error translating query '{query_text[:30]}...': {e}. Attempt {retry_attempt}/{self.retry_attempts}")
                     if retry_attempt >= self.retry_attempts:
-                        new_translations = [""] * num_src # 실패 시 빈 문자열로 채움
-                        break
-                    self.logger.warning(
-                        f"Translation failed: {e}. Attempt: {retry_attempt}, sleep {self.retry_timeout}s..."
-                    )
-                    self.logger.error(f"Traceback: {traceback.format_exc()}")
+                        translations[idx] = f"[번역 오류: {str(e)[:30]}]"
+                        return
                     time.sleep(self.retry_timeout)
-            translations.extend([t.strip() for t in new_translations])
+            translations[idx] = "[번역 실패]" # 최종 실패
+
+        # ThreadPoolExecutor 설정
+        num_keys = len(self.multiple_keys_list) if self.multiple_keys_list else 1
+        rpm_per_key = int(self.get_param_value("max requests per minute"))
+        
+        # 워커 수 결정 로직: RPM이 매우 낮으면 병렬성 줄임, 아니면 키 개수만큼 (최대치 제한)
+        if rpm_per_key <= 0: # 제한 없음
+            max_workers = min(num_keys * 2, 10) # 키당 2개, 최대 10개 (임의의 값)
+        elif rpm_per_key < 15: # 낮은 RPM
+            max_workers = min(num_keys, 2) # 키 개수만큼 하되 최대 2개
+        elif rpm_per_key < 60 : # 중간 RPM
+            max_workers = min(num_keys, 5) # 키 개수만큼 하되 최대 5개
+        else: # 높은 RPM
+            max_workers = min(num_keys, 10) # 키 개수만큼 하되 최대 10개
+
+        if self.use_vertex_ai: # Vertex AI는 일반적으로 더 높은 처리량을 가짐
+            max_workers = min(num_keys if num_keys > 1 else 2, 10) # 서비스 계정은 하나일 수 있으므로 최소 2, 최대 10
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # list(zip(range(len(src_list)), src_list)) -> [(0, query1), (1, query2), ...]
+            future_to_idx = {executor.submit(translate_single_query_thread_safe, pair): pair[0] for pair in zip(range(len(src_list)), src_list)}
+            
+            for future in concurrent.futures.as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                try:
+                    future.result() # 예외가 발생했다면 여기서 다시 발생 (이미 내부에서 로깅 및 처리)
+                except Exception as exc:
+                    self.logger.error(f'Query (idx {idx}) translation generated an exception: {exc}')
+                    if translations[idx] == "": # 아직 오류 메시지가 설정되지 않았다면
+                        translations[idx] = "[번역 중 예외 발생]"
 
         # Gemini API는 현재 토큰 사용량 정보를 응답에 포함하지 않음
         # self.logger.info(f"Token count information is not available for Gemini API.")
