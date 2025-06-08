@@ -501,27 +501,159 @@ class GeminiTranslator(BaseTranslator):
     
     def _translate_single_block(self, text_block: str, to_lang: str, chat_sample: Optional[List[str]]) -> str:
         """단일 텍스트 블록을 번역합니다."""
-        # 단일 블록에 대한 프롬프트 생성 (기존 _assemble_prompts 로직 간소화)
         prompt_template = (
             self.params["prompt template"]["value"].format(to_lang=to_lang).rstrip()
         )
-        prompt = f"{prompt_template}\n<|1|>{text_block}"
-        
+
+        # 단일 블록이므로 <|1|> 구분자는 제거하거나, _request_translation_with_chat_sample_google에서 처리하도록 단순화
+        prompt = f"{prompt_template}\n{text_block}"
+
+        # 새로운 SDK config 방식 사용
+        config = genai_types.GenerateContentConfig(
+            system_instruction=self.chat_system_template,
+            max_output_tokens=self.max_tokens,
+            temperature=self.temperature,
+            top_p=self.top_p,
+            safety_settings=[
+                genai_types.SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold="BLOCK_NONE"),
+                genai_types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH", threshold="BLOCK_NONE"),
+                genai_types.SafetySetting(category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="BLOCK_NONE"),
+                genai_types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_NONE"),
+            ]
+        )
+
+        prompt = f"{prompt_template}\n<|1|>{text_block}" 
+
         retry_attempt = 0
         while retry_attempt < self.retry_attempts:
             try:
-                response_text = self._request_translation(prompt, chat_sample)
-                if not isinstance(response_text, str):
-                    response_text = str(response_text)
-                # 단일 블록이므로, 응답에서 구분자 파싱 없이 바로 사용 (또는 간단한 정리)
-                # <|1|> 응답 형식을 따른다면, 해당 부분만 추출
-                match = re.search(r"<\|1\|>(.*)", response_text, re.DOTALL)
-                return match.group(1).strip() if match else response_text.strip()
+                # _request_translation_with_chat_sample_google을 직접 호출하거나,
+                # _request_translation이 원본 응답 객체 또는 예외를 반환하도록 수정 필요.
+                # 여기서는 _request_translation_with_chat_sample_google을 직접 호출한다고 가정.
+                # chat_sample은 contents 구성 시 함께 전달
+                contents_for_single_block = []
+                if chat_sample:
+                    contents_for_single_block.extend([
+                        {"role": "user", "parts": [{"text": chat_sample[0]}]},
+                        {"role": "model", "parts": [{"text": chat_sample[1]}]}
+                    ])
+                contents_for_single_block.append({"role": "user", "parts": [{"text": prompt}]})
+
+                response = self.client.models.generate_content(
+                    model=(self.override_model or self.model),
+                    contents=contents_for_single_block,
+                    config=config
+                )
+
+                if self._handle_safety_response(response): # 안전 필터에 걸렸는지 확인
+                    return f"[안전 필터로 차단됨: {text_block[:30]}...]"
+                
+                return response.text.strip() if hasattr(response, 'text') and response.text else ""
+
+
             except Exception as e:
+                if self._check_safety_block(e): # 예외 객체에서 안전 필터링 확인
+                    self.logger.warning(f"Single block blocked by safety filters (exception): {text_block[:30]}... Error: {e}")
+                    return f"[안전 필터로 차단됨: {text_block[:30]}...]"
+        
                 retry_attempt += 1
-                self.logger.warning(f"Single block translation failed for '{text_block[:30]}...': {e}. Attempt: {retry_attempt}")
+                if retry_attempt >= self.retry_attempts:
+                    self.logger.error(f"Single block translation failed after {self.retry_attempts} attempts for '{text_block[:30]}...': {e}")
+                    return "" # 모든 재시도 실패 시 빈 문자열 반환
+                
                 time.sleep(self.retry_timeout)
         return "" # 모든 재시도 실패 시 빈 문자열 반환
+
+    def _check_safety_block(self, exception: Exception) -> bool:
+        """안전 필터링으로 인한 차단인지 확인"""
+        # 1. 응답 객체의 promptFeedback 확인 (공식 방법)
+        # google.generativeai.types.BlockedPromptException 와 같은 특정 예외 타입을 직접 확인하는 것이 더 좋음
+        # from google.generativeai.types import BlockedPromptException
+        # if isinstance(exception, BlockedPromptException):
+        #     self.logger.warning(f"Content blocked by API (BlockedPromptException).")
+        #     return True
+
+        if hasattr(exception, 'response'): # 일부 API 오류는 response 속성을 가질 수 있음
+            response = exception.response
+            if hasattr(response, 'prompt_feedback') and response.prompt_feedback:
+                if hasattr(response.prompt_feedback, 'block_reason') and response.prompt_feedback.block_reason:
+                    block_reason_value = response.prompt_feedback.block_reason
+                    # BlockedReason enum 값과 비교 또는 문자열로 변환하여 비교
+                    if isinstance(block_reason_value, genai_types.BlockedReason):
+                        block_reason_str = block_reason_value.name # PROHIBITED_CONTENT, OTHER 등
+                    else: # 이미 문자열일 경우
+                        block_reason_str = str(block_reason_value)
+                    
+                    if block_reason_str in ['PROHIBITED_CONTENT', 'OTHER', 'SAFETY']: # SAFETY도 추가
+                        self.logger.warning(f"Content blocked by API (prompt_feedback). Reason: {block_reason_str}")
+                        return True
+            
+            # 2. candidates 내 finishReason 확인
+            if hasattr(response, 'candidates'):
+                for candidate in response.candidates:
+                    if hasattr(candidate, 'finish_reason'):
+                        finish_reason_value = candidate.finish_reason
+                        if isinstance(finish_reason_value, genai_types.FinishReason):
+                            finish_reason_str = finish_reason_value.name # SAFETY 등
+                        else:
+                            finish_reason_str = str(finish_reason_value)
+
+                        if finish_reason_str == 'SAFETY':
+                            self.logger.warning("Content blocked due to safety filters (candidate.finish_reason).")
+                            # 상세 안전 평가 로깅
+                            if hasattr(candidate, 'safety_ratings'):
+                                for rating in candidate.safety_ratings:
+                                    if hasattr(rating, 'blocked') and rating.blocked:
+                                        self.logger.warning(f"Blocked category: {rating.category}, probability: {rating.probability}")
+                            return True
+
+
+        # 예외 메시지 확인 (보조적 방법)
+        error_msg = str(exception).upper()
+        safety_keywords = ['PROHIBITED_CONTENT', 'SAFETY', 'BLOCKED', 'HARMFUL'] # PROHIBITED_CONTENT는 로그에서 확인된 키워드
+        is_safety_issue = any(keyword in error_msg for keyword in safety_keywords)
+        if is_safety_issue:
+            self.logger.warning(f"Safety-related keyword found in error message: {str(exception)}")
+        return is_safety_issue
+    
+    def _handle_safety_response(self, response) -> bool:
+        """공식 문서 기준 응답 구조 확인하여 안전 필터링으로 차단되었는지 여부 반환"""
+        if not response:
+            return False
+            
+        # promptFeedback 확인
+        if hasattr(response, 'prompt_feedback') and response.prompt_feedback:
+            if hasattr(response.prompt_feedback, 'block_reason') and response.prompt_feedback.block_reason:
+                block_reason_value = response.prompt_feedback.block_reason
+                block_reason_str = block_reason_value.name if isinstance(block_reason_value, genai_types.BlockedReason) else str(block_reason_value)
+                if block_reason_str in ['PROHIBITED_CONTENT', 'OTHER', 'SAFETY']:
+                    self.logger.warning(f"Prompt blocked by API (prompt_feedback). Reason: {block_reason_str}")
+                    return True
+        
+        # candidates의 safetyRatings 확인
+        if hasattr(response, 'candidates'):
+            for candidate in response.candidates:
+                if hasattr(candidate, 'finish_reason') and isinstance(candidate.finish_reason, genai_types.FinishReason) and candidate.finish_reason == genai_types.FinishReason.SAFETY:
+                    if hasattr(candidate, 'safety_ratings'):
+                        for rating in candidate.safety_ratings:
+                            if hasattr(rating, 'blocked') and rating.blocked:
+                                self.logger.warning(f"Content blocked (candidate.finish_reason=SAFETY). Category: {rating.category}, Probability: {rating.probability}")
+                    return True
+        return False
+
+
+    def _fallback_to_block_translation(self, src_list: List[str], to_lang: str, chat_sample: Optional[List[str]]) -> List[str]:
+        """블록별 번역 폴백 메서드"""
+        translations = []
+        for i, text_block in enumerate(src_list):
+            try:
+                translation = self._translate_single_block(text_block, to_lang, chat_sample)
+                translations.append(translation)
+                self.logger.debug(f"Successfully translated block {i+1}/{len(src_list)} via fallback.")
+            except Exception as e_block:
+                self.logger.error(f"Failed to translate block {i+1} during fallback: {e_block}")
+                translations.append(f"[번역 실패: {text_block[:30]}...]") # 원본 텍스트 또는 빈 문자열 반환
+        return translations
 
     def updateParam(self, param_key: str, param_content):
         super().updateParam(param_key, param_content)
@@ -848,13 +980,19 @@ class GeminiTranslator(BaseTranslator):
 
     def _translate(self, src_list: List[str]) -> List[str]:
         translations = []
-        to_lang = self.lang_map[self.lang_target]
+        to_lang = self.lang_map.get(self.lang_target, self.lang_target)
         queries = src_list
         chat_sample = self.chat_sample
 
         for prompt, num_src in self._assemble_prompts(queries, to_lang=to_lang):
             retry_attempt = 0
-            while True:
+            current_chunk_start_index = len(translations) # 현재 청크가 시작되는 원본 src_list에서의 인덱스
+
+            # _request_translation이 원본 응답 객체 또는 예외를 반환하도록 수정되었다고 가정
+            # 또는 _request_translation_with_chat_sample_google을 직접 호출하고, 그 결과를 처리
+            
+            while retry_attempt < self.retry_attempts: # 페이지 단위 재시도 루프
+                
                 try:
                     response_text = self._request_translation(prompt, chat_sample)
                     if not isinstance(response_text, str):
@@ -870,48 +1008,38 @@ class GeminiTranslator(BaseTranslator):
                         else:
                             # 그래도 개수가 맞지 않으면 예외 발생
                             raise InvalidNumTranslations(f"Expected {num_src} translations, got {len(new_translations)}. Response: '{response_text[:200]}...'")
+                    translations.extend([t.strip() for t in new_translations]) # 성공 시 결과 추가
                     break 
                 except InvalidNumTranslations as e:
                     retry_attempt += 1
                     message = f"Translation count mismatch: {e}\nprompt:\n{prompt}\ntranslations:\n{new_translations}\nresponse:\n{response_text}"
-                    if retry_attempt >= self.retry_attempts:
+                    if retry_attempt >= self.retry_attempts: # 재시도 횟수 초과
                         self.logger.error(message)
-                        new_translations = [""] * num_src # 실패 시 빈 문자열로 채움
+                        # 해당 청크에 대해 빈 번역 또는 오류 메시지 추가
+                        translations.extend(["[번역 오류: 개수 불일치]"] * num_src)
                         break
                     self.logger.warning(
                         message + f"\nRetrying. Attempt: {retry_attempt}"
                     )
                 except Exception as e:
-                    retry_attempt += 1
-                    if retry_attempt >= self.retry_attempts:
-                        new_translations = [""] * num_src # 실패 시 빈 문자열로 채움
+                    if self._check_safety_block(e):
+                        self.logger.warning(f"Page-level translation blocked by safety filters for prompt chunk. Error: {e}. Falling back to block-by-block translation for this chunk.")
+                        # 현재 청크의 원본 텍스트 추출                    
+                        current_chunk_texts = src_list[current_chunk_start_index : current_chunk_start_index + num_src]
+                        
+                        chunk_translations = self._fallback_to_block_translation(current_chunk_texts, to_lang, chat_sample)
+                        translations.extend(chunk_translations)
                         break
-                    self.logger.warning(
-                        f"Translation failed: {e}. Attempt: {retry_attempt}, sleep {self.retry_timeout}s..."
-                    )
-                    self.logger.error(f"Traceback: {traceback.format_exc()}")
-                    time.sleep(self.retry_timeout)
-            translations.extend([t.strip() for t in new_translations])
-            
-            # 특정 예외 발생 시 문장 단위 번역 시도
-            except Exception as e:
-                # 예외 메시지 또는 타입에 따라 특정 오류인지 확인
-                if "PROHIBITED_CONTENT" in str(e).upper() or "PROHIBITED" in str(e).upper() or "INTERNAL" in str(e).upper() or "OTHER" in str(e).upper() : # 실제 예외 조건으로 수정
-                    self.logger.warning(f"Page-level translation failed with specific error: {e}. Attempting block-by-block translation for this chunk.")
-                    # 현재 청크(prompt에 포함된 queries)를 개별적으로 번역
-                    # num_src를 사용하여 원래 queries의 해당 부분을 가져와야 함
-                    # queries는 전체 src_list이고, 현재 prompt는 queries의 일부일 수 있음
-                    # 이 예제에서는 현재 prompt에 포함된 텍스트들을 다시 분리하여 시도한다고 가정
-                    # 실제로는 _assemble_prompts에서 사용된 queries의 해당 부분을 가져와야 함
-                    # 여기서는 단순화를 위해 prompt에서 <|id|> 태그로 분리된 텍스트를 사용
-                    original_texts_in_prompt = [text_part.split('>', 1)[1] for text_part in prompt.splitlines() if text_part.startswith("<|")]
-                    
-                    chunk_translations = [self._translate_single_block(text, to_lang, chat_sample) for text in original_texts_in_prompt]
-                    translations.extend(chunk_translations) # 개별 번역된 결과를 전체 결과에 추가
-                    break # 현재 프롬프트(청크)에 대한 루프 종료
+                    else: # 안전 관련 예외가 아닌 다른 예외
+                        retry_attempt += 1
+                        if retry_attempt >= self.retry_attempts:
+                            self.logger.warning(f"Translation attempt {retry_attempt}/{self.retry_attempts} failed for prompt chunk: {e}. Sleeping for {self.retry_timeout}s...")
+                            translations.extend([f"[번역 오류: {str(e)[:30]}]"] * num_src)
+                            break 
+                        self.logger.warning(f"Translation failed: {e}. Attempt: {retry_attempt}/{self.retry_attempts}, sleeping for {self.retry_timeout}s...")
+                        self.logger.error(f"Traceback: {traceback.format_exc()}")
+                        time.sleep(self.retry_timeout)
 
-        # Gemini API는 현재 토큰 사용량 정보를 응답에 포함하지 않음
-        # self.logger.info(f"Token count information is not available for Gemini API.")
 
         return translations
 
