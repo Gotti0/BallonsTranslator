@@ -187,10 +187,6 @@ class GeminiTranslator(BaseTranslator):
         if project_id:
             os.environ['GOOGLE_CLOUD_PROJECT'] = project_id
             os.environ['GOOGLE_CLOUD_LOCATION'] = location
-            # google-genai SDK는 vertexai=True 플래그로 Vertex AI 사용을 명시하므로,
-            # GOOGLE_GENAI_USE_VERTEXAI는 필수는 아닐 수 있습니다.
-            # os.environ['GOOGLE_GENAI_USE_VERTEXAI'] = 'true' 
-            
             self.logger.debug(f"Set Vertex AI environment variables: PROJECT={project_id}, LOCATION={location}")
 
     def _load_service_account_info(self) -> Optional[Dict]:
@@ -227,48 +223,44 @@ class GeminiTranslator(BaseTranslator):
         if use_vertex:
             self._ensure_vertex_client()
         else:
-            self._ensure_gemini_client()
+            # Gemini API 클라이언트는 _request_translation_thread_safe 내에서 API 키와 함께 처리
+            pass
 
-    def _ensure_gemini_client(self):
-        """기존 Gemini Developer API 클라이언트 초기화"""
-        current_api_key = self._select_api_key()
-        if not current_api_key:
-            self.logger.error("No API key available for translation.")
+    def _ensure_gemini_client(self, api_key: str):
+        """특정 API 키로 Gemini Developer API 클라이언트 초기화 또는 업데이트"""
+        if not api_key:
+            self.logger.error("No API key provided for Gemini client.")
             raise ValueError("No API key available.")
-        
-        # 프록시 설정은 genai.Client 생성 시 직접 지원하지 않음.
-        # google-genai는 일반적으로 HTTP_PROXY/HTTPS_PROXY 환경 변수를 사용합니다.
-        # httpx_client를 명시적으로 전달하여 프록시를 설정할 수 있으나,
-        # 여기서는 환경 변수 사용을 권장하는 로그만 남깁니다.
+
         if self.proxy:
             self.logger.info(
                 f"Proxy configured: {self.proxy}. Ensure your environment (HTTP_PROXY, HTTPS_PROXY) is set up for google-generativeai SDK."
             )
 
-        if not self.client: # 또는 API 키가 변경된 경우 클라이언트 재생성 (여기서는 단순화)
+        # 클라이언트가 없거나, 현재 클라이언트의 API 키가 다르다면 (이 부분은 단순화된 예시) 재생성
+        # 실제로는 self.client.api_key 와 같은 속성이 없으므로, API 키 변경 시 항상 재생성
+        if not self.client or getattr(self.client, '_api_key', None) != api_key:
             try:
-                self.client = genai.Client(api_key=current_api_key)
-                self.logger.debug(f"Initialized Google Gen AI client")
+                self.client = genai.Client(api_key=api_key)
+                setattr(self.client, '_api_key', api_key) # API 키 추적을 위한 임시 속성
+                self.logger.debug(f"Initialized Google Gen AI client with key: {api_key[:6]}...")
             except Exception as e:
-                self.logger.error(f"Failed to initialize client: {e}")
+                self.logger.error(f"Failed to initialize client with key {api_key[:6]}...: {e}")
                 self.client = None
                 raise
 
     def _get_project_id(self) -> Optional[str]:
         """프로젝트 ID 자동 추출"""
-        # 수동 설정된 프로젝트 ID 우선 사용
         manual_project_id = self.get_param_value("vertex_project_id").strip()
         if manual_project_id:
             return manual_project_id
         
-        # 서비스 계정 파일에서 추출
         service_account_info = self._load_service_account_info()
         if service_account_info and 'project_id' in service_account_info:
             project_id = service_account_info['project_id']
             self.logger.info(f"Auto-extracted project ID: {project_id}")
             return project_id
         
-        # 환경 변수에서 확인 (GOOGLE_CLOUD_PROJECT는 _setup_vertex_environment에서 설정될 수 있음)
         env_project = os.environ.get('GOOGLE_CLOUD_PROJECT')
         if env_project:
             self.logger.info(f"Using project ID from environment: {env_project}")
@@ -287,9 +279,8 @@ class GeminiTranslator(BaseTranslator):
         service_account_file = self.get_param_value("vertex_service_account_file").strip()
         
         try:
-            # 서비스 계정 파일 설정
             if service_account_file:
-                from pathlib import Path # pathlib 임포트
+                from pathlib import Path
                 file_path = Path(service_account_file).expanduser()
                 if file_path.exists():
                     os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = str(file_path)
@@ -297,19 +288,17 @@ class GeminiTranslator(BaseTranslator):
                 else:
                     self.logger.warning(f"Service account file not found: {file_path}, will try default credentials.")
             
-            # Vertex AI 클라이언트 생성
             self.client = genai.Client(
-                project=project_id, # project_id 대신 project 사용
+                project=project_id,
                 location=location,
                 vertexai=True,
             )
-            
             self.logger.info(f"Initialized Vertex AI client for project: {project_id}, location: {location}")
-            
         except Exception as e:
             self.logger.error(f"Failed to initialize Vertex AI client: {e}")
             self.client = None
             raise
+
 
     @property
     def use_vertex_ai(self) -> bool:
@@ -334,121 +323,9 @@ class GeminiTranslator(BaseTranslator):
             return param.get("value")
         return param # Direct value if not a dict (e.g. for older param structures)
 
-    def _select_api_key(self) -> str:
-        api_keys = self.multiple_keys_list
-        if not api_keys:
-            return self.apikey # 단일 키 사용
+    
 
-        # 여러 키가 있는 경우 로테이션
-        selected_key = None
-        for _ in range(len(api_keys)): # 모든 키를 한 번씩 확인
-            index = self.current_key_index % len(api_keys)
-            key_to_check = api_keys[index]
-            
-            count, start_time = self.key_usage.get(key_to_check, (0, time.time()))
-            now = time.time()
-            rpm_limit = int(self.get_param_value("max requests per minute"))
-
-            if now - start_time >= 60: # 1분이 지났으면 리셋
-                self.key_usage[key_to_check] = (0, now)
-                count = 0
-            
-            if rpm_limit <= 0 or count < rpm_limit: # RPM 제한이 없거나, 아직 여유가 있으면
-                selected_key = key_to_check
-                self.key_usage[selected_key] = (count + 1, start_time if now - start_time < 60 else now)
-                self.current_key_index = (index + 1) % len(api_keys) # 다음 요청을 위해 인덱스 이동
-                break
-            
-            self.current_key_index = (index + 1) % len(api_keys) # 다음 키로 넘어감
-
-        if not selected_key: # 모든 키가 RPM 제한에 도달한 경우
-            # 가장 오래전에 사용된 (또는 곧 리셋될) 키를 선택하고 대기
-            # 간단하게 첫 번째 키를 선택하고 _respect_key_limit에서 대기하도록 함
-            selected_key = api_keys[self.current_key_index % len(api_keys)]
-            self._respect_key_limit(selected_key) # 여기서 대기 발생
-            count, start_time = self.key_usage.get(selected_key, (0, time.time()))
-            self.key_usage[selected_key] = (count + 1, start_time) # 사용량 업데이트
-            self.current_key_index = (self.current_key_index + 1) % len(api_keys)
-
-        return selected_key
-
-    def _respect_key_limit(self, key: str):
-        rpm = int(self.get_param_value("max requests per minute"))
-        if rpm <= 0:
-            return
-        
-        count, start_time = self.key_usage.get(key, (0, time.time()))
-        now = time.time()
-
-        if now - start_time >= 60:
-            self.key_usage[key] = (0, now) # 분이 지났으면 카운트 리셋
-            count = 0 # 아래 로직에서 사용하기 위해 업데이트
-        
-        if count >= rpm:
-            wait_time = 60.1 - (now - start_time) # 약간의 버퍼 추가
-            masked_key = key[:6] + "*" * (len(key) - 6)
-            self.logger.warning(
-                f"Key {masked_key} reached RPM limit ({rpm}). Waiting {wait_time:.2f} seconds."
-            )
-            if wait_time > 0:
-                time.sleep(wait_time)
-            self.key_usage[key] = (0, time.time()) # 대기 후 카운트 리셋
-
-    def _respect_delay(self):
-        current_time = time.time()
-        # Global RPM limit (if any, though individual key limits are primary)
-        # This part can be simplified if key-specific RPM is the main concern.
-        # For now, keeping a global check as a fallback or for overall rate control.
-        global_rpm_limit = int(self.get_param_value("max requests per minute")) # Assuming this is a global limit if no multiple keys
-
-        if global_rpm_limit > 0 and not self.multiple_keys_list: # Only apply if single key or as a general cap
-            if current_time - self.minute_start_time >= 60:
-                self.request_count_minute = 0
-                self.minute_start_time = current_time
-
-            if self.request_count_minute >= global_rpm_limit:
-                wait_time = 60.1 - (current_time - self.minute_start_time)
-                if wait_time > 0:
-                    self.logger.warning(
-                        f"Reached global RPM limit ({global_rpm_limit}). Waiting {wait_time:.2f} seconds."
-                    )
-                    time.sleep(wait_time)
-                self.request_count_minute = 0
-                self.minute_start_time = time.time()
-
-        time_since_last_request = current_time - self.last_request_time
-        delay = float(self.get_param_value("delay"))
-        if time_since_last_request < delay:
-            sleep_time = delay - time_since_last_request
-            if sleep_time > 0:
-                time.sleep(sleep_time)
-
-        self.last_request_time = time.time()
-        if not self.multiple_keys_list: # Only increment global counter if not using multiple keys (key-specific handles it)
-            self.request_count_minute += 1
-
-    def _request_translation(self, prompt: str, chat_sample: Optional[List[str]]) -> str:
-        self._respect_delay() # Global delay
-
-        # Select key and respect its limit BEFORE making the call
-        if not self.use_vertex_ai: # Vertex AI uses service account, not API keys in this way
-            api_key = self._select_api_key()
-            if not api_key:
-                return "Error: No API key available."
-            self._respect_key_limit(api_key) # Respect key-specific RPM
-        
-        try:
-            self._ensure_client()
-        except ValueError as ve:
-            return str(ve)
-        except Exception as e:
-            self.logger.error(f"Error during client initialization: {e}")
-            return f"Error: Client initialization failed - {e}"
-
-        result = self._request_translation_with_chat_sample_google(prompt, chat_sample)
-        if not isinstance(result, str):
-            result = str(result)
-        return result
+    
 
     def _translate(self, src_list: List[str]) -> List[str]:
         translations = []
@@ -615,35 +492,25 @@ class GeminiTranslator(BaseTranslator):
 
     
 
-    def _respect_key_limit(self, key: str):
-        rpm = int(self.get_param_value("max requests per minute"))
-        if rpm <= 0:
-            return
-        
-        count, start_time = self.key_usage.get(key, (0, time.time()))
-        now = time.time()
-
-        if now - start_time >= 60:
-            self.key_usage[key] = (0, now) # 분이 지났으면 카운트 리셋
-            count = 0 # 아래 로직에서 사용하기 위해 업데이트
-        
-        if count >= rpm:
-            wait_time = 60.1 - (now - start_time) # 약간의 버퍼 추가
-            masked_key = key[:6] + "*" * (len(key) - 6)
-            self.logger.warning(
-                f"Key {masked_key} reached RPM limit ({rpm}). Waiting {wait_time:.2f} seconds."
-            )
-            time.sleep(wait_time)
-            self.key_usage[key] = (0, time.time()) # 대기 후 카운트 리셋
-
-    def _select_api_key(self) -> str:
+    def _select_api_key_and_wait_if_needed(self) -> Optional[str]:
+        """Selects an API key and waits if RPM limit is reached. Returns the key or None if no keys."""
         api_keys = self.multiple_keys_list
         if not api_keys:
-            return self.apikey # 단일 키 사용
+            # 단일 키 사용 시 RPM 관리
+            single_key = self.apikey
+            if not single_key:
+                self.logger.error("No API key configured.")
+                return None
+            self._respect_key_limit(single_key)
+            return single_key
 
-        # 여러 키가 있는 경우 로테이션
+        # 여러 키가 있는 경우 로테이션 및 RPM 관리
+
         selected_key = None
-        for _ in range(len(api_keys)): # 모든 키를 한 번씩 확인
+        min_wait_time = float('inf')
+        key_to_wait_for = None
+
+        for i in range(len(api_keys)):
             index = self.current_key_index % len(api_keys)
             key_to_check = api_keys[index]
             
@@ -651,40 +518,59 @@ class GeminiTranslator(BaseTranslator):
             now = time.time()
             rpm_limit = int(self.get_param_value("max requests per minute"))
 
-            if now - start_time >= 60: # 1분이 지났으면 리셋
+            if now - start_time >= 60:
                 self.key_usage[key_to_check] = (0, now)
                 count = 0
             
-            if rpm_limit <= 0 or count < rpm_limit: # RPM 제한이 없거나, 아직 여유가 있으면
+            if rpm_limit <= 0 or count < rpm_limit:
                 selected_key = key_to_check
                 self.key_usage[selected_key] = (count + 1, start_time if now - start_time < 60 else now)
-                self.current_key_index = (index + 1) % len(api_keys) # 다음 요청을 위해 인덱스 이동
+                self.current_key_index = (index + 1) % len(api_keys)
                 break
             
-            self.current_key_index = (index + 1) % len(api_keys) # 다음 키로 넘어감
+            else:
+                # 이 키는 현재 사용할 수 없음, 대기 시간 계산
+                wait_time_for_this_key = 60.1 - (now - start_time)
+                if wait_time_for_this_key < min_wait_time:
+                    min_wait_time = wait_time_for_this_key
+                    key_to_wait_for = key_to_check
+            self.current_key_index = (index + 1) % len(api_keys)
 
-        if not selected_key: # 모든 키가 RPM 제한에 도달한 경우
-            # 가장 오래전에 사용된 (또는 곧 리셋될) 키를 선택하고 대기
-            # 간단하게 첫 번째 키를 선택하고 _respect_key_limit에서 대기하도록 함
-            selected_key = api_keys[self.current_key_index % len(api_keys)]
-            self._respect_key_limit(selected_key) # 여기서 대기 발생
+        if not selected_key and key_to_wait_for:
+            # 모든 키가 RPM 제한에 도달, 가장 빨리 사용 가능해질 키를 위해 대기
+            if min_wait_time > 0:
+                self.logger.warning(
+                    f"All keys reached RPM limit. Waiting for key {key_to_wait_for[:6]}... for {min_wait_time:.2f} seconds."
+                )
+                time.sleep(min_wait_time)
+            # 대기 후 해당 키 사용량 초기화 및 선택
+            self.key_usage[key_to_wait_for] = (0, time.time())
+            selected_key = key_to_wait_for
+
+            
             count, start_time = self.key_usage.get(selected_key, (0, time.time()))
-            self.key_usage[selected_key] = (count + 1, start_time) # 사용량 업데이트
-            self.current_key_index = (self.current_key_index + 1) % len(api_keys)
+            self.key_usage[selected_key] = (count + 1, start_time)
 
         return selected_key
 
 
     def _request_translation_thread_safe(self, prompt: str, chat_sample: Optional[List[str]]) -> str:
         with self.rpm_lock:
-            self._respect_delay() # Global delay
-            if not self.use_vertex_ai: # Vertex AI uses service account
-                api_key = self._select_api_key()
+            self._respect_delay() # 전역 최소 요청 간격 준수
+
+            if self.use_vertex_ai:
+                # Vertex AI는 서비스 계정 사용, 키별 RPM 관리 불필요
+                # _ensure_client에서 Vertex AI 클라이언트 처리
+                pass
+            else:
+                # Gemini API는 키별 RPM 관리 필요
+                api_key = self._select_api_key_and_wait_if_needed()
+                
                 if not api_key:
                     return "Error: No API key available."
-                self._respect_key_limit(api_key) # Respect key-specific RPM
+                self._ensure_gemini_client(api_key) # 선택된 키로 클라이언트 설정
         try:
-            self._ensure_client()  # configure 대신 client 초기화
+            self._ensure_client() # Vertex AI의 경우 여기서 클라이언트 초기화
         except ValueError as ve: # No API key available
             return str(ve)
         except Exception as e:
@@ -695,6 +581,29 @@ class GeminiTranslator(BaseTranslator):
         if not isinstance(result, str):
             result = str(result)
         return result
+    
+    def _respect_key_limit(self, key: str):
+        """특정 API 키의 RPM 제한을 확인하고 필요한 경우 대기합니다."""
+        rpm_limit = int(self.get_param_value("max requests per minute"))
+        if rpm_limit <= 0: # RPM 제한이 설정되지 않았으면 통과
+            return
+
+        count, start_time = self.key_usage.get(key, (0, time.time()))
+        now = time.time()
+
+        if now - start_time >= 60: # 1분이 지났으면 사용량 리셋
+            self.key_usage[key] = (0, now)
+            count = 0
+        
+        if count >= rpm_limit: # RPM 제한에 도달했다면
+            wait_time = 60.1 - (now - start_time) # 0.1초 버퍼 추가
+            masked_key = key[:6] + "*" * (len(key) - 6) if len(key) > 6 else key
+            self.logger.warning(f"Key {masked_key} reached RPM limit ({rpm_limit}). Waiting {wait_time:.2f} seconds.")
+            if wait_time > 0:
+                time.sleep(wait_time)
+            self.key_usage[key] = (0, time.time()) # 대기 후 사용량 리셋
+
+
 
     def _request_translation_with_chat_sample_google(
         self, prompt: str, chat_sample: Optional[List[str]]
@@ -764,7 +673,7 @@ class GeminiTranslator(BaseTranslator):
         try:
             # 올바른 API 호출 방법
             response = self.client.models.generate_content(
-                model=model_name,
+                model=model_name, # Vertex AI 사용 시 "models/" 접두사 없음
                 contents=contents,
                 config=config 
             )
