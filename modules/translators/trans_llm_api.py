@@ -635,10 +635,11 @@ class GeminiTranslator(BaseTranslator):
         })
 
         # 시스템 프롬프트 설정
-        system_instruction_content = self.chat_system_template
+        system_instruction = self.chat_system_template
 
         # GenerateContentConfig 사용
         config = genai_types.GenerateContentConfig(
+            system_instruction = system_instruction,
             max_output_tokens=self.max_tokens, # Gemini는 max_output_tokens 사용
             temperature=self.temperature,
             top_p=self.top_p,
