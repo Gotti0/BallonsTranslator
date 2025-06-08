@@ -623,6 +623,7 @@ class GeminiTranslator(BaseTranslator):
         # _respect_key_limit correctly handles the single key case.
 
         time_since_last_request = current_time - self.last_request_time
+        current_time = time.time() # current_time 정의
         
         delay = float(self.get_param_value("delay"))
         if time_since_last_request < delay:
