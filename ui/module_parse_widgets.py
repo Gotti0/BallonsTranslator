@@ -202,6 +202,26 @@ class ParamWidget(QWidget):
                     param_widget = ParamEditor(param_key)
                     param_widget.setText(value)
 
+                elif param_type == 'file_path_selector':
+                    # Use 'long' size by default for file paths, unless specified
+                    size_str = param_dict.get('size', 'long')
+                    size = size2width(size_str)
+                    param_widget = ParamComboBox(
+                        param_key,
+                        param_dict.get('options', []), # Pass empty options or allow configured ones
+                        size=size,
+                        scrollWidget=scrollWidget,
+                        flush_btn=False, # No flush button for path selector
+                        path_selector=True # Enable path selection button
+                    )
+                    param_widget = ParamEditor(param_key)
+                    param_widget.setText(value)
+
+                elif param_type == 'text':
+                    # Use 'median' size by default for 'text' type, unless specified
+                    size_str = param_dict.get('size', 'median')
+                    param_widget = ParamLineEditor(param_key, force_digital=False, size=size_str)
+                    param_widget.setText(str(value))
                 elif param_type == 'checkbox':
                     param_widget = ParamCheckBox(param_key)
                     if isinstance(value, str):
@@ -219,6 +239,13 @@ class ParamWidget(QWidget):
 
                 elif param_type == 'check_group':
                     param_widget = ParamCheckGroup(param_key, check_group=value)
+
+                elif param_type == 'text_readonly':
+                    # Determine size, default to 'median' if not specified, as it's for display
+                    size_str = param_dict.get('size', 'median')
+                    param_widget = ParamLineEditor(param_key, force_digital=False, size=size_str)
+                    param_widget.setText(str(value))
+                    param_widget.setReadOnly(True)
 
                 if param_widget is not None:
                     param_widget.paramwidget_edited.connect(self.on_paramwidget_edited)
