@@ -216,17 +216,7 @@ DANGEROUS_CONTENT:BLOCK_NONE""",
     def retry_timeout(self) -> int:
         return int(self._get_param_value('retry_timeout', 10))
 
-    @property
-    def delay(self) -> float:
-        return float(self._get_param_value('delay', 1.0))
 
-    def delay(self) -> float: # Changed from @property
-        val = self._get_param_value('delay', 1.0)
-        try:
-            return float(val)
-        except (ValueError, TypeError):
-            self.logger.warning(f"Invalid delay value '{val}' for GenAITranslator. Using default 1.0.")
-            return 1.0
 
     @property
     def max_requests_per_minute(self) -> int: # This remains a property as it's likely accessed as such
@@ -403,9 +393,13 @@ DANGEROUS_CONTENT:BLOCK_NONE""",
         # Fixed Delay Logic (runs after potential RPM sleep)
         current_time_for_fixed_delay = time.time()
         time_since_last_request = current_time_for_fixed_delay - self.last_request_time
-        if time_since_last_request < self.delay:
-            sleep_time = self.delay - time_since_last_request
-            if sleep_time > 0: # Ensure sleep_time is positive
+        # Directly get the float value for delay
+        actual_delay_value = float(self._get_param_value('delay', 1.0))
+
+        if time_since_last_request < actual_delay_value:
+            sleep_time = actual_delay_value - time_since_last_request
+            
+            if sleep_time > 0: # Ensure sleep_time is positive # This line was comparing float with method object
                 self.logger.debug(f"Waiting {sleep_time:.2f} seconds (fixed delay) before next GenAI request.")
                 time.sleep(sleep_time)
 
@@ -438,13 +432,12 @@ DANGEROUS_CONTENT:BLOCK_NONE""",
         self.logger.debug(self._format_prompt_log(text_to_translate, system_instruction, user_content_prompt))
 
 
-        # generation_config_dict now directly used by types.GenerateContentConfig
-        # safety_settings is already parsed into the correct list format by _parse_safety_settings
-        # and is included in the generation_config_dict passed to this method.
-        final_generation_config = types.GenerateContentConfig(
-            # system_instruction is part of the 'contents' for some models or handled differently.
-            # For the new SDK, system instructions are often part of the model config or initial message.
-            # We will pass it as part of the GenerateContentConfig for now.
+        # Create GenerateContentConfig with system_instruction and other parameters
+        # The 'contents' parameter for generate_content should only contain the user prompt.
+        final_config = types.GenerateContentConfig(
+            # system_instruction is now part of the config
+            # safety_settings is already parsed into the correct list format by _parse_safety_settings
+            system_instruction=types.Content(parts=[types.Part(text=system_instruction)]), # Encapsulate system_instruction
             safety_settings=safety_settings,
             **generation_config_dict # The rest of the params like max_tokens, temp, etc.
         )
@@ -460,8 +453,8 @@ DANGEROUS_CONTENT:BLOCK_NONE""",
 
             response = self.client.models.generate_content(
                 model=model_arg, 
-                contents=[system_instruction, user_content_prompt], # Pass system instruction and user prompt
-                generation_config=final_generation_config
+                contents=user_content_prompt, # 리스트 제거, 직접 전달
+                config=final_config  # generation_config -> config로 변경
             
             )
                         
@@ -532,7 +525,7 @@ DANGEROUS_CONTENT:BLOCK_NONE""",
                 self._respect_delay() # Apply delay before each attempt
                 self.logger.info(f"Translating text ({i+1}/{len(src_list)}): \"{text_to_translate[:50]}...\" (Attempt {attempt+1}/{self.retry_attempts+1})")
                 result_text, response_obj = self._make_api_call(
-                    text_to_translate, model_to_use, generation_config_dict, current_safety_settings
+                    text_to_translate, model_to_use, generation_config_dict, current_safety_settings # Pass the parsed safety settings
                 )
                 if response_obj or not result_text.startswith("["): # Basic check for success
                     translated_text_for_item = result_text
