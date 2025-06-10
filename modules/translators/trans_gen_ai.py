@@ -497,7 +497,53 @@ DANGEROUS_CONTENT:BLOCK_NONE""",
                  return f"[Prompt blocked by API: {e}]", None
             if isinstance(e, types.StopCandidateError): # Updated exception type
                  return f"[Candidate generation stopped unexpectedly: {e}]", None
+            # Catching a general google.api_core.exceptions.GoogleAPIError might be useful
+            # For example, google.api_core.exceptions.InvalidArgument
+            if hasattr(e, 'message') and "model parameter is not set" in str(e.message).lower():
+                self.logger.error(f"Model parameter not set. Ensure 'model_name' ({model_to_use}) is valid for the client type (Google AI vs Vertex AI).")
+                return f"[API Error: Model not set or invalid: {model_to_use}]", None
             return f"[API request failed: {e}]", None
+
+    def _translate(self, src_list: List[str]) -> List[str]:
+        """
+        Synchronous translation method.
+        """
+        if not self.client:
+            self.logger.error("Google GenAI client not initialized. Cannot translate.")
+            return ["[Client Error: Not initialized]" for _ in src_list]
+
+        translations = []
+        model_to_use = self.model_name
+        generation_config_dict = {
+            'max_output_tokens': self.max_output_tokens,
+            'temperature': self.temperature,
+            'top_p': self.top_p,
+            'top_k': self.top_k,
+        }
+        current_safety_settings = self.parsed_safety_settings
+
+        for i, text_to_translate in enumerate(src_list):
+            if not text_to_translate.strip():
+                translations.append("")
+                continue
+
+            translated_text_for_item = ""
+            for attempt in range(self.retry_attempts + 1):
+                self._respect_delay() # Apply delay before each attempt
+                self.logger.info(f"Translating text ({i+1}/{len(src_list)}): \"{text_to_translate[:50]}...\" (Attempt {attempt+1}/{self.retry_attempts+1})")
+                result_text, response_obj = self._make_api_call(
+                    text_to_translate, model_to_use, generation_config_dict, current_safety_settings
+                )
+                if response_obj or not result_text.startswith("["): # Basic check for success
+                    translated_text_for_item = result_text
+                    break
+                elif attempt < self.retry_attempts:
+                    time.sleep(self.retry_timeout)
+                else: # All retries failed
+                    self.logger.error(f"All {self.retry_attempts + 1} attempts failed for item {i+1} (\"{text_to_translate[:50]}...\"). Error: {result_text}")
+                    translated_text_for_item = result_text # Return the error message
+            translations.append(translated_text_for_item)
+        return translations
 
     async def _request_translation_async_job(self, text_to_translate: str, index: int) -> Tuple[int, str]:
         """
