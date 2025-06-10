@@ -345,12 +345,13 @@ DANGEROUS_CONTENT:BLOCK_NONE""",
                 
                 harm_category_member = getattr(types.HarmCategory, category_key, None)
                 if harm_category_member is None: 
-                    harm_category_member = getattr(types.HarmCategory, "HARM_CATEGORY_" + category_key, None)
+                    harm_category_member = getattr(types.HarmCategory, f"HARM_CATEGORY_{category_key}", None)
 
                 harm_block_threshold_member = getattr(types.HarmBlockThreshold, threshold_key, None)
 
                 if harm_category_member and harm_block_threshold_member:
-                    parsed_settings[harm_category_member] = harm_block_threshold_member
+                    parsed_settings.append(types.SafetySetting(category=harm_category_member, threshold=harm_block_threshold_member))
+
                 else:
                     self.logger.warning(f"Invalid safety setting line: '{line}'. Category or Threshold not found. Skipping.")
             except Exception as e:
@@ -419,28 +420,41 @@ DANGEROUS_CONTENT:BLOCK_NONE""",
         
         self.logger.debug(self._format_prompt_log(text_to_translate, system_instruction, user_content_prompt))
 
+
+        # generation_config_dict now directly used by types.GenerateContentConfig
+        # safety_settings is already parsed into the correct list format by _parse_safety_settings
+        # and is included in the generation_config_dict passed to this method.
+        final_generation_config = types.GenerateContentConfig(
+            system_instruction=system_instruction, # Added here
+            safety_settings=safety_settings,       # Added here (should be self.parsed_safety_settings)
+            **generation_config_dict # The rest of the params like max_tokens, temp, etc.
+        )
+
         try:
             # The actual SDK call
             response = self.client.models.generate_content(
                 model=f'models/{model_to_use}', # Model name needs to be prefixed with 'models/'
-                contents=full_prompt,
-                generation_config=generation_config_dict, # Parameter name is 'generation_config'
-                safety_settings=safety_settings
+                ccontents=user_content_prompt, # Use only user part of prompt here
+                generation_config=final_generation_config
+            
             )
                         
             if not response.candidates:
-                block_reason_msg = "Unknown reason"
-                if response.prompt_feedback and response.prompt_feedback.block_reason:
-                    block_reason_msg = response.prompt_feedback.block_reason.name
-                
+                    
                 safety_ratings_details = []
                 if response.prompt_feedback and response.prompt_feedback.safety_ratings:
                     for rating in response.prompt_feedback.safety_ratings:
                         safety_ratings_details.append(f"{rating.category.name}: {rating.probability.name}")
                 safety_info = ", ".join(safety_ratings_details) if safety_ratings_details else "No safety ratings available"
 
-                self.logger.error(f"GenAI translation blocked. Reason: {block_reason_msg}. Safety Ratings: [{safety_info}]")
-                return f"[Blocked by Safety Filter: {block_reason_msg}]", response
+                # Get block reason if available
+                block_reason_msg = "Unknown reason"
+                if response.prompt_feedback and response.prompt_feedback.block_reason:
+                    block_reason_msg = response.prompt_feedback.block_reason.name # or .value for int
+                self.logger.error(f"GenAI translation blocked. Reason: {block_reason_msg}. Safety Ratings: [{safety_info}]. Full prompt feedback: {response.prompt_feedback}")
+                return f"[Blocked by Safety Filter: {block_reason_msg}]", response # Return the response object
+
+
 
             if response.candidates[0].finish_reason.name != "STOP":
                 finish_reason_name = response.candidates[0].finish_reason.name
@@ -471,13 +485,19 @@ DANGEROUS_CONTENT:BLOCK_NONE""",
         
         # Prepare these once per text_to_translate to pass to _make_api_call
         model_to_use = self.model_name
+        # generation_config_dict for _make_api_call should not include system_instruction or safety_settings here,
+        # as _make_api_call will construct the final GenerateContentConfig with them.
+       
         generation_config_dict = {
             'max_output_tokens': self.max_output_tokens,
             'temperature': self.temperature,
             'top_p': self.top_p,
             'top_k': self.top_k,
         }
-        safety_settings = self.parsed_safety_settings
+        # safety_settings for _make_api_call is self.parsed_safety_settings
+        current_safety_settings = self.parsed_safety_settings
+
+
 
         for attempt in range(self.retry_attempts + 1):
             try:
@@ -496,7 +516,8 @@ DANGEROUS_CONTENT:BLOCK_NONE""",
                     text_to_translate, 
                     model_to_use, 
                     generation_config_dict, 
-                    safety_settings
+                    current_safety_settings # Pass the parsed safety settings
+
                 )
 
                 if response_obj: # Indicates a successful or partially successful call
@@ -538,40 +559,7 @@ DANGEROUS_CONTENT:BLOCK_NONE""",
         ]
         return "\n".join(log_message)
 
-    async def _translate_async(self, src_list: List[str]) -> List[str]:
-        if not self.client:
-            self.logger.error("Google GenAI client not initialized. Cannot translate.")
-            return [""] * len(src_list)
-
-        translations = []
-        num_texts = len(src_list)
-        for i, src_text in enumerate(src_list):
-            if not src_text.strip(): 
-                translations.append("")
-                continue
-
-            translated_text = ""
-            for attempt in range(self.retry_attempts + 1):
-                try:
-                    self.logger.info(f"Translating text ({i+1}/{num_texts}): \"{src_text[:50]}...\" (Attempt {attempt+1}/{self.retry_attempts+1})")
-                    translated_text = self._request_translation(src_text)
-                    break 
-                except GenAIAPIError as e:
-                    self.logger.warning(f"Attempt {attempt + 1} failed for \"{src_text[:50]}...\": {e}")
-                    if attempt < self.retry_attempts:
-                        time.sleep(self.retry_timeout)
-                    else:
-                        self.logger.error(f"All {self.retry_attempts + 1} attempts failed for \"{src_text[:50]}...\".")
-                        translated_text = f"[Translation Error: {e}]" 
-                except Exception as e: 
-                    self.logger.error(f"Unexpected error on attempt {attempt + 1} for \"{src_text[:50]}...\": {e}")
-                    self.logger.debug(traceback.format_exc())
-                    if attempt < self.retry_attempts:
-                        time.sleep(self.retry_timeout)
-                    else:
-                        translated_text = f"[Unexpected Translation Error: {e}]"
-            translations.append(translated_text)
-        return translations
+   
 
     def updateParam(self, param_key: str, param_content):
         super().updateParam(param_key, param_content)
