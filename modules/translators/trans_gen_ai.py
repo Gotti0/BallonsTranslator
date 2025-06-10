@@ -161,6 +161,7 @@ DANGEROUS_CONTENT:BLOCK_NONE""",
         self.request_count_minute = 0
         self.minute_start_time = time.time()
         self.executor = None # Will be initialized later
+        self.is_vertex_client = False # To track client mode
         self._initialize_client()
 
     @property
@@ -219,8 +220,16 @@ DANGEROUS_CONTENT:BLOCK_NONE""",
     def delay(self) -> float:
         return float(self._get_param_value('delay', 1.0))
 
+    def delay(self) -> float: # Changed from @property
+        val = self._get_param_value('delay', 1.0)
+        try:
+            return float(val)
+        except (ValueError, TypeError):
+            self.logger.warning(f"Invalid delay value '{val}' for GenAITranslator. Using default 1.0.")
+            return 1.0
+
     @property
-    def max_requests_per_minute(self) -> int:
+    def max_requests_per_minute(self) -> int: # This remains a property as it's likely accessed as such
         return int(self._get_param_value('max_requests_per_minute', 0))
 
     @property
@@ -235,12 +244,6 @@ DANGEROUS_CONTENT:BLOCK_NONE""",
             self.executor.shutdown(wait=False) # Shutdown existing executor
         self.executor = ThreadPoolExecutor(max_workers=self.max_parallel_requests if self.max_parallel_requests > 0 else None)
         self.logger.info(f"ThreadPoolExecutor initialized with max_workers={self.max_parallel_requests if self.max_parallel_requests > 0 else 'default'}")
-        # Reset any previous global genai configuration
-        # This is important because genai.configure is global.
-        try:
-            genai.configure(credentials=None, api_key=None)
-        except Exception as e:
-            self.logger.warning(f"Could not reset genai global configuration: {e}")
 
         try:
             if self.proxy:
@@ -260,26 +263,40 @@ DANGEROUS_CONTENT:BLOCK_NONE""",
                         self.params['gcp_project_id_display']['value'] = "Parse Error"
                         self.logger.warning(f"Could not parse project_id from SA file: {self.service_account_json_path}. Proceeding with SA file for auth.")
 
-                    credentials = service_account.Credentials.from_service_account_file(self.service_account_json_path)
-                    genai.configure(credentials=credentials)
-                    self.client = genai.Client()
-                    self.logger.info("Google GenAI client initialized using Service Account JSON.")
+                    # For Service Account JSON, configure the client for Vertex AI
+                    # Use the parsed_project_id from the SA file.
+                    gcp_project_id_from_sa = self.params['gcp_project_id_display']['value']
+                    gcp_location = self._get_param_value('gcp_location')
+
+                    if not gcp_project_id_from_sa or gcp_project_id_from_sa in ["N/A", "Parse Error", "File Not Found", "Path Not Set", "Init Error", "Project ID Required"]:
+                        self.logger.error(f"GCP Project ID ('{gcp_project_id_from_sa}') is missing or invalid. Cannot initialize client for Vertex AI with Service Account.")
+                        self.params['gcp_project_id_display']['value'] = "Project ID Required"
+                        return
+                    if not gcp_location:
+                        self.logger.error("GCP Location is missing. Cannot initialize client for Vertex AI. Please set 'gcp_location' parameter (e.g., us-central1).")
+                        # Optionally, update a display field for location if it exists
+                        return
+
+                    credentials_obj = service_account.Credentials.from_service_account_file(self.service_account_json_path)
+                    self.client = genai.Client(vertexai=True, project=gcp_project_id_from_sa, location=gcp_location, credentials=credentials_obj)
+                    self.is_vertex_client = True
+                    self.logger.info(f"Google GenAI client initialized for Vertex AI using Service Account JSON. Project: {gcp_project_id_from_sa}, Location: {gcp_location}")
                 elif self.service_account_json_path: # Path provided but does not exist
                     self.logger.error(f"Service Account JSON file not found: {self.service_account_json_path}")
                     self.params['gcp_project_id_display']['value'] = "File Not Found"
                 else: # No path provided
                     self.logger.error("Auth method is 'Service Account JSON' but no path is provided.")
-                    self.params['gcp_project_id_display']['value'] = "Path Not Set"
+                    self.params['gcp_project_id_display']['value'] = "Path Not Set" # Ensure this is set if path is missing
 
             elif self.auth_method == 'API Key':
                 self.params['gcp_project_id_display']['value'] = 'N/A (API Key Auth)'
                 if self.api_key:
                     self.logger.info("Initializing Google GenAI client with API key.")
-                    genai.configure(api_key=self.api_key)
-                    self.client = genai.Client()
+                    self.client = genai.Client(api_key=self.api_key)
                 else:
                     self.logger.info("API key not provided for 'API Key' auth. Attempting Application Default Credentials (ADC).")
                     self.logger.info("Ensure GOOGLE_APPLICATION_CREDENTIALS env var is set or running in a configured Google Cloud environment.")
+                    # Note: For non-Vertex genai.Client(), ADC usually means GOOGLE_API_KEY env var.
                     self.client = genai.Client() # ADC will be used
             else:
                 self.logger.error(f"Unknown authentication method: {self.auth_method}")
@@ -287,7 +304,10 @@ DANGEROUS_CONTENT:BLOCK_NONE""",
 
             if self.client:
                 self.parsed_safety_settings = self._parse_safety_settings()
-                self.logger.info(f"Google GenAI client initialized successfully. Auth Method: {self.auth_method}. Safety Settings: {self.parsed_safety_settings or 'SDK defaults'}")
+                client_mode = "Vertex AI" if self.is_vertex_client else "Google AI"
+                self.logger.info(f"Google GenAI client ({client_mode}) initialized successfully. Auth Method: {self.auth_method}. Safety Settings: {self.parsed_safety_settings or 'SDK defaults'}")
+                if not self.is_vertex_client and self.auth_method == 'API Key' and not self.api_key:
+                    self.logger.info("Client initialized using implicit API_KEY (e.g. GOOGLE_API_KEY env var or other ADC mechanism for Google AI API).")
             else:
                 # Ensure parsed_safety_settings is initialized even on client init failure,
                 # as _parse_safety_settings doesn't depend on the client.
@@ -331,8 +351,8 @@ DANGEROUS_CONTENT:BLOCK_NONE""",
         settings_str = self._get_param_value('safety_settings', '').strip()
         if not settings_str:
             return None # Use SDK defaults
-            
-        parsed_settings = {}
+
+        parsed_settings = [] # Initialize as a list
         for line in settings_str.splitlines():
             line = line.strip()
             if not line or ':' not in line or line.startswith('#'): # Allow comments
@@ -342,7 +362,7 @@ DANGEROUS_CONTENT:BLOCK_NONE""",
                 category_str, threshold_str = map(str.strip, line.split(':', 1))
                 category_key = category_str.upper()
                 threshold_key = threshold_str.upper()
-                
+
                 harm_category_member = getattr(types.HarmCategory, category_key, None)
                 if harm_category_member is None: 
                     harm_category_member = getattr(types.HarmCategory, f"HARM_CATEGORY_{category_key}", None)
@@ -351,7 +371,6 @@ DANGEROUS_CONTENT:BLOCK_NONE""",
 
                 if harm_category_member and harm_block_threshold_member:
                     parsed_settings.append(types.SafetySetting(category=harm_category_member, threshold=harm_block_threshold_member))
-
                 else:
                     self.logger.warning(f"Invalid safety setting line: '{line}'. Category or Threshold not found. Skipping.")
             except Exception as e:
@@ -416,8 +435,6 @@ DANGEROUS_CONTENT:BLOCK_NONE""",
             text_to_translate=text_to_translate
         )
         
-        full_prompt = f"{system_instruction}\n\n{user_content_prompt}"
-        
         self.logger.debug(self._format_prompt_log(text_to_translate, system_instruction, user_content_prompt))
 
 
@@ -425,16 +442,25 @@ DANGEROUS_CONTENT:BLOCK_NONE""",
         # safety_settings is already parsed into the correct list format by _parse_safety_settings
         # and is included in the generation_config_dict passed to this method.
         final_generation_config = types.GenerateContentConfig(
-            system_instruction=system_instruction, # Added here
-            safety_settings=safety_settings,       # Added here (should be self.parsed_safety_settings)
+            # system_instruction is part of the 'contents' for some models or handled differently.
+            # For the new SDK, system instructions are often part of the model config or initial message.
+            # We will pass it as part of the GenerateContentConfig for now.
+            safety_settings=safety_settings,
             **generation_config_dict # The rest of the params like max_tokens, temp, etc.
         )
 
         try:
-            # The actual SDK call
+            model_arg = model_to_use
+            if self.is_vertex_client:
+                if model_arg.startswith("models/"): # Vertex usually doesn't use this prefix
+                    model_arg = model_arg.split("models/", 1)[1]
+            else: # Google AI API
+                if not model_arg.startswith("models/"):
+                    model_arg = f"models/{model_arg}"
+
             response = self.client.models.generate_content(
-                model=f'models/{model_to_use}', # Model name needs to be prefixed with 'models/'
-                ccontents=user_content_prompt, # Use only user part of prompt here
+                model=model_arg, 
+                contents=[system_instruction, user_content_prompt], # Pass system instruction and user prompt
                 generation_config=final_generation_config
             
             )
@@ -575,8 +601,11 @@ DANGEROUS_CONTENT:BLOCK_NONE""",
 
     def _get_param_value(self, key: str, default_val=None):
         """Helper to safely get parameter values."""
-        if key in self.params and 'value' in self.params[key]:
-            return self.params[key]['value']
-        if key in self.params and not isinstance(self.params[key], dict): # Fallback for simple params
-            return self.params[key]
+        param_entry = self.params.get(key)
+        if isinstance(param_entry, dict):
+            value = param_entry.get('value')
+            if value is not None: # It could be an empty string, which is not None
+                return value
+        elif param_entry is not None: # Fallback for simple params (not a dict)
+            return param_entry
         return default_val
