@@ -1,7 +1,7 @@
 # trans_gen_ai.py
 from google import genai
 import time
-from google.genai import types # For HarmCategory, HarmBlockThreshold, GenerationConfig, exceptions
+from google.genai import types, errors # For HarmCategory, HarmBlockThreshold, GenerationConfig, exceptions
 import os
 import json
 import traceback
@@ -254,6 +254,11 @@ DANGEROUS_CONTENT:BLOCK_NONE""",
                         self.logger.warning(f"Could not parse project_id from SA file: {self.service_account_json_path}. Proceeding with SA file for auth.")
 
                     # For Service Account JSON, configure the client for Vertex AI
+                    # Add necessary scopes for Vertex AI
+                    scopes = [
+                        "https://www.googleapis.com/auth/cloud-aiplatform"
+                    ]
+
                     # Use the parsed_project_id from the SA file.
                     gcp_project_id_from_sa = self.params['gcp_project_id_display']['value']
                     gcp_location = self._get_param_value('gcp_location')
@@ -267,7 +272,10 @@ DANGEROUS_CONTENT:BLOCK_NONE""",
                         # Optionally, update a display field for location if it exists
                         return
 
-                    credentials_obj = service_account.Credentials.from_service_account_file(self.service_account_json_path)
+                    credentials_obj = service_account.Credentials.from_service_account_file(
+                        self.service_account_json_path,
+                        scopes=scopes
+                    )
                     self.client = genai.Client(vertexai=True, project=gcp_project_id_from_sa, location=gcp_location, credentials=credentials_obj)
                     self.is_vertex_client = True
                     self.logger.info(f"Google GenAI client initialized for Vertex AI using Service Account JSON. Project: {gcp_project_id_from_sa}, Location: {gcp_location}")
@@ -483,15 +491,35 @@ DANGEROUS_CONTENT:BLOCK_NONE""",
             # self.logger.debug(f"GenAI Raw Response Text: \"{translated_text[:100]}...\"") # Logged by caller
             return translated_text, response
 
-        except Exception as e:
-            self.logger.error(f"Google GenAI API request failed: {e}")
+        except types.BlockedPromptException as e:
+            self.logger.error(f"GenAI translation blocked by API (BlockedPromptException): {e}")
+            safety_feedback_str = ""
+            if hasattr(e, 'safety_feedback') and e.safety_feedback and hasattr(e.safety_feedback, 'safety_ratings'):
+                safety_ratings_details = [f"{rating.category.name}: {rating.probability.name}" for rating in e.safety_feedback.safety_ratings]
+                safety_feedback_str = f" Safety Ratings: [{', '.join(safety_ratings_details)}]"
+            return f"[Prompt blocked by API{safety_feedback_str}]", None
+        except types.StopCandidateException as e:
+            self.logger.warning(f"GenAI candidate generation stopped (StopCandidateException): {e}")
+            finish_reason_name = "Unknown"
+            if hasattr(e, 'finish_reason') and e.finish_reason and hasattr(e.finish_reason, 'name'):
+                finish_reason_name = e.finish_reason.name
+            return f"[Candidate generation stopped: {finish_reason_name}]", None
+        except errors.GoogleAPIError as e: # Catch broader Google API errors
+            error_msg_lower = str(e).lower()
+            self.logger.error(f"GoogleAPIError: {e}")
+            if any(keyword in error_msg_lower for keyword in ["blocked", "safety", "filter"]):
+                return f"[Blocked by Safety Filter: {e}]", None
+            elif any(keyword in error_msg_lower for keyword in ["permission denied", "authentication", "unauthenticated", "credentials"]):
+                 return f"[API Authentication/Permission Error: {e}]", None
+            elif "quota" in error_msg_lower:
+                return f"[API Quota Exceeded: {e}]", None
+            return f"[Google API Error: {e}]", None
+        except Exception as e: # General fallback
+            error_msg_lower = str(e).lower()
+            self.logger.error(f"Google GenAI API request failed with unexpected error: {e}")
             self.logger.debug(traceback.format_exc())
-            if isinstance(e, types.BlockedPromptError): # Updated exception type
-                 return f"[Prompt blocked by API: {e}]", None
-            if isinstance(e, types.StopCandidateError): # Updated exception type
-                 return f"[Candidate generation stopped unexpectedly: {e}]", None
-            # Catching a general google.api_core.exceptions.GoogleAPIError might be useful
-            # For example, google.api_core.exceptions.InvalidArgument
+            if any(keyword in error_msg_lower for keyword in ["blocked", "safety", "filter"]):
+                return f"[Blocked by Safety Filter (general check): {e}]", None
             if hasattr(e, 'message') and "model parameter is not set" in str(e.message).lower():
                 self.logger.error(f"Model parameter not set. Ensure 'model_name' ({model_to_use}) is valid for the client type (Google AI vs Vertex AI).")
                 return f"[API Error: Model not set or invalid: {model_to_use}]", None
