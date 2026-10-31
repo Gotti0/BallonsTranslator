@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 from ballontranslator.utils.config import ModuleConfig, ProgramConfig, json_dump_program_config
 from ballontranslator.utils.llm_profiles import (
+    apply_ollama_model_catalog,
     default_codex_profile,
     DEFAULT_OCR_PROMPT,
     DEFAULT_TRANSLATION_PROMPT,
@@ -16,6 +17,7 @@ from ballontranslator.utils.llm_profiles import (
     copy_profile,
     default_profile,
     default_profiles,
+    is_ollama_profile,
     profile_by_id,
     load_profiles,
     profile_to_dict,
@@ -770,6 +772,37 @@ class SecretStoreTest(unittest.TestCase):
         )
         self.assertEqual(selected.image_model, profile.image_model)
         self.assertEqual(selected.image_model_options, profile.image_model_options)
+
+
+class OllamaModelCatalogTest(unittest.TestCase):
+    def test_is_ollama_profile_matches_id_or_default_url(self) -> None:
+        self.assertTrue(is_ollama_profile(default_profile('Ollama')))
+        self.assertTrue(is_ollama_profile(LLMProfile(
+            id='custom',
+            base_url=PROVIDER_DEFAULTS['Ollama']['base_url'],
+        )))
+        self.assertTrue(is_ollama_profile(LLMProfile(
+            id='custom',
+            base_url='http://localhost:11434/v1/chat/completions',
+        )))
+        self.assertFalse(is_ollama_profile(default_profile('LM Studio')))
+        self.assertFalse(is_ollama_profile(default_profile('OpenAI')))
+
+    def test_apply_ollama_model_catalog_replaces_options_and_preserves_selection(self) -> None:
+        profile = default_profile('Ollama')
+        profile.model = 'llama3.1'
+        profile.vision_model = 'missing-model'
+        profile.image_model = 'keep-image'
+        profile.image_model_options = ['keep-image']
+        changed = apply_ollama_model_catalog(profile, ['qwen2.5', 'llama3.1', 'qwen2.5', ''])
+        self.assertTrue(changed)
+        self.assertEqual(profile.model_options, ['llama3.1', 'qwen2.5'])
+        self.assertEqual(profile.vision_model_options, ['llama3.1', 'qwen2.5'])
+        self.assertEqual(profile.model, 'llama3.1')
+        self.assertEqual(profile.vision_model, 'llama3.1')
+        self.assertEqual(profile.image_model, 'keep-image')
+        self.assertEqual(profile.image_model_options, ['keep-image'])
+        self.assertFalse(apply_ollama_model_catalog(profile, ['qwen2.5', 'llama3.1']))
 
 
 if __name__ == '__main__':

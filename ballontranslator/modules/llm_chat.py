@@ -8,13 +8,14 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 from .context.errors import provider_error_message
 from .context.token_usage import format_completion_token_usage
 from .exceptions import (
     LLMApiKeyRequiredError,
     LLMAuthenticationError,
+    LLMBaseURLRequiredError,
     LLMOutputLimitError,
     LLMRequestStopped,
     LLMUserActionRequiredError,
@@ -73,6 +74,54 @@ def _uses_provider_base_url(base_url: str, provider: str) -> bool:
     return base_url == provider_url or base_url.startswith(
         f'{provider_url}/'
     )
+
+
+def list_ollama_models(
+    base_url: str,
+    stop_event: Optional[threading.Event] = None,
+) -> List[str]:
+    """Fetch installed model IDs from an Ollama OpenAI-compatible ``/v1/models``.
+
+    Uses a direct HTTP client (``trust_env=False``) so localhost is not routed
+    through a system proxy. Raises when the base URL is missing, the catalog is
+    empty, or the request fails before a usable list is returned.
+
+    >>> list_ollama_models.__name__
+    'list_ollama_models'
+    """
+    configured = str(base_url or '').strip()
+    if not configured:
+        raise LLMBaseURLRequiredError('ollama', 'Ollama')
+    sdk_base = _openai_sdk_base_url(configured) or None
+    if stop_event is not None and stop_event.is_set():
+        raise LLMRequestStopped()
+
+    import httpx  # type: ignore
+    import openai  # type: ignore
+
+    http_client = httpx.Client(trust_env=False)
+    client = openai.OpenAI(
+        api_key=LLMChatRequester.dummy_api_key,
+        base_url=sdk_base,
+        http_client=http_client,
+    )
+    try:
+        if stop_event is not None and stop_event.is_set():
+            raise LLMRequestStopped()
+        page = client.models.list()
+        models: List[str] = []
+        for entry in getattr(page, 'data', None) or []:
+            model_id = str(getattr(entry, 'id', '') or '').strip()
+            if model_id and model_id not in models:
+                models.append(model_id)
+        models.sort()
+        if not models:
+            raise RuntimeError(
+                'Ollama returned no models. Pull a model, then refresh again.'
+            )
+        return models
+    finally:
+        client.close()
 
 
 def gpt_model_version(model: str) -> Optional[Tuple[int, int]]:

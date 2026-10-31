@@ -1,7 +1,8 @@
 import json
+import threading
 import uuid
 from html import escape
-from typing import get_type_hints
+from typing import List, Optional, get_type_hints
 
 from qtpy.QtWidgets import (
     QApplication,
@@ -22,7 +23,7 @@ from qtpy.QtWidgets import (
     QStyle,
     QStyleOptionGroupBox,
 )
-from qtpy.QtCore import QEvent, QRectF, QTimer, Qt, QUrl, Signal
+from qtpy.QtCore import QEvent, QObject, QRectF, QThread, QTimer, Qt, QUrl, Signal
 from qtpy.QtGui import QColor, QDesktopServices, QFont, QIcon, QLinearGradient, QMouseEvent, QPaintEvent, QPainter, QPainterPath, QPen, QPixmap, QRegion
 
 try:
@@ -30,7 +31,7 @@ try:
 except ImportError:
     from qtpy.QtWidgets import QAction
 
-from .custom_widget import ParamComboBox, NoBorderPushBtn, ScrollBar
+from .custom_widget import ParamComboBox, NoBorderPushBtn, RefreshButton, ScrollBar
 from .icon_rendering import render_svg_pixmap
 from .llm_modality import (
     LLM_MODALITY_IMAGE_COLOR,
@@ -40,6 +41,7 @@ from .llm_modality import (
 )
 from .misc import themed_icon_path
 from .module_parse_widgets import ParamWidget, SecretParamWidget
+from ballontranslator.modules.exceptions import LLMRequestStopped
 from ballontranslator.utils.shared import LLM_PROFILE_EDITOR_WIDTH_SCALE, LLM_PROMPT_EDITOR_WIDTH, size2width
 from ballontranslator.utils.config import pcfg
 from ballontranslator.utils.llm_profiles import (
@@ -47,7 +49,9 @@ from ballontranslator.utils.llm_profiles import (
     LLM_OCR_KEY,
     LLM_TRANSLATOR_KEY,
     LLMProfile,
+    apply_ollama_model_catalog,
     image_model_choices,
+    is_ollama_profile,
     is_profile_title_url,
     parse_profile_title,
     copy_profile,
@@ -59,6 +63,31 @@ from ballontranslator.utils.llm_profiles import (
     store_api_key,
     split_image_model_selection,
 )
+
+
+class OllamaModelsWorker(QThread):
+    """Fetch Ollama ``/v1/models`` off the UI thread for one profile card.
+
+    >>> OllamaModelsWorker.__name__
+    'OllamaModelsWorker'
+    """
+
+    def __init__(self, base_url: str, parent: QObject) -> None:
+        super().__init__(parent)
+        self.base_url = base_url
+        self.stop_event = threading.Event()
+        self.models: Optional[List[str]] = None
+        self.error: Optional[BaseException] = None
+
+    def run(self) -> None:
+        try:
+            from ballontranslator.modules.llm_chat import list_ollama_models
+
+            self.models = list_ollama_models(self.base_url, self.stop_event)
+        except LLMRequestStopped:
+            pass
+        except Exception as error:
+            self.error = error.with_traceback(None)
 
 
 PROFILE_COMMON_PARAM_DEFS = [
@@ -387,6 +416,7 @@ class ProfileCardWidget(QGroupBox):
         self._previous_vision_model_text = ''
         self._previous_image_model_text = ''
         self._action_buttons_visible = False
+        self._models_worker: Optional[OllamaModelsWorker] = None
         self.profile_param_display_names = {
             'base_url': self.tr('Base URL'),
             'image_base_url': self.tr('Image Base URL'),
@@ -541,6 +571,13 @@ class ProfileCardWidget(QGroupBox):
         self.remove_model_btn.setToolTip(self.tr('Delete current model'))
         self.remove_model_btn.setFixedSize(16, 16)
         self.remove_model_btn.clicked.connect(self.deleteCurrentModel)
+        self.refresh_models_btn = RefreshButton(self)
+        self.refresh_models_btn.setFixedSize(20, 20)
+        self.refresh_models_btn.setAccessibleName(self.tr('Refresh models'))
+        self.refresh_models_btn.setToolTip(
+            self.tr('Refresh installed models from the Ollama OpenAI-compatible API.')
+        )
+        self.refresh_models_btn.clicked.connect(self.refreshOllamaModels)
         self.model_modality_row = QWidget(self.model_summary_widget)
         self.model_modality_row.setObjectName('LLMProfileModalityRow')
         self.model_modality_row.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
@@ -552,6 +589,7 @@ class ProfileCardWidget(QGroupBox):
         model_label_row.addWidget(self.model_label, 0, Qt.AlignmentFlag.AlignLeft)
         model_label_row.addWidget(self.add_model_btn, 0, Qt.AlignmentFlag.AlignLeft)
         model_label_row.addWidget(self.remove_model_btn, 0, Qt.AlignmentFlag.AlignLeft)
+        model_label_row.addWidget(self.refresh_models_btn, 0, Qt.AlignmentFlag.AlignLeft)
         model_label_row.addStretch(1)
         self.model_combo = ParamComboBox('model', profile.model_options, size=size2width('short'), scrollWidget=scrollWidget)
         self.model_combo.setObjectName('LLMProfileModelCombo')
@@ -715,6 +753,7 @@ class ProfileCardWidget(QGroupBox):
         self.refreshVisionBadge()
         self.refreshImageBadge()
         self.refreshConditionalVisibility()
+        self.refreshOllamaControls()
         self.refreshSelectionBorder()
 
     def _install_detail_editor_scrollbars(self):
@@ -1050,6 +1089,70 @@ class ProfileCardWidget(QGroupBox):
         self.remove_vision_model_btn.setVisible(visible and bool(self.profile.support_vision))
         self.add_image_model_btn.setVisible(visible and bool(self.profile.support_image))
         self.remove_image_model_btn.setVisible(visible and bool(self.profile.support_image))
+        self.refreshOllamaControls()
+
+    def refreshOllamaControls(self) -> None:
+        show = is_ollama_profile(self.profile)
+        busy = self._models_worker is not None
+        self.refresh_models_btn.setVisible(show)
+        self.refresh_models_btn.set_busy(busy)
+        if show and not busy:
+            self.refresh_models_btn.setEnabled(True)
+
+    def refreshOllamaModels(self) -> None:
+        if not is_ollama_profile(self.profile) or self._models_worker is not None:
+            return
+        base_url = str(self.profile.base_url or '').strip()
+        if not base_url:
+            QMessageBox.warning(
+                self,
+                self.tr('Ollama'),
+                self.tr('Set the Ollama base URL before refreshing models.'),
+            )
+            return
+        self._models_worker = OllamaModelsWorker(base_url, self)
+        self._models_worker.finished.connect(self.finishOllamaModelsRefresh)
+        self.refreshOllamaControls()
+        self._models_worker.start()
+
+    def finishOllamaModelsRefresh(self) -> None:
+        worker = self._models_worker
+        if worker is None:
+            return
+        self._models_worker = None
+        cancelled = worker.stop_event.is_set()
+        models = worker.models
+        error = None if cancelled else worker.error
+        worker.deleteLater()
+        self.refreshOllamaControls()
+        if cancelled:
+            return
+        if error is not None:
+            QMessageBox.warning(
+                self,
+                self.tr('Ollama'),
+                self.tr('Could not refresh Ollama models. Check that Ollama is running and the base URL is correct.\n\n{error}').format(
+                    error=str(error)
+                ),
+            )
+            return
+        if models is None:
+            return
+        if apply_ollama_model_catalog(self.profile, models):
+            self.syncFromProfile()
+            self.profile_changed.emit()
+            self.profile_summary_changed.emit()
+            self.profile_selector_changed.emit()
+
+    def shutdownModelsWorker(self) -> None:
+        worker = self._models_worker
+        if worker is None:
+            return
+        worker.stop_event.set()
+        worker.wait()
+        self._models_worker = None
+        worker.deleteLater()
+        self.refreshOllamaControls()
 
     def _position_header_controls(self) -> None:
         style_option = QStyleOptionGroupBox()
@@ -1432,6 +1535,8 @@ class ProfileCardWidget(QGroupBox):
         if param_key == 'require_api_key':
             self.refreshConditionalVisibility()
             self.refreshKeyStatus()
+        elif param_key == 'base_url':
+            self.refreshOllamaControls()
         elif param_key == 'vision_detail_level':
             self.profile_summary_changed.emit()
         elif param_key == 'image_base_url':
@@ -1644,6 +1749,8 @@ class LLMProfilesWidget(QWidget):
             item = self.rows_layout.takeAt(0)
             widget = item.widget()
             if widget is not None:
+                if isinstance(widget, ProfileCardWidget):
+                    widget.shutdownModelsWorker()
                 widget.deleteLater()
         self.rows.clear()
 
@@ -1815,6 +1922,7 @@ class LLMProfilesWidget(QWidget):
             pcfg.module.inpaint_llm_id = pcfg.module.llm_profiles[0].id
         row = self.rows.pop(profile_id, None)
         if row is not None:
+            row.shutdownModelsWorker()
             row.collapse()
             self.rows_layout.removeWidget(row)
             row.deleteLater()

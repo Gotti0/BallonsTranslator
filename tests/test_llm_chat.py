@@ -7,12 +7,14 @@ import httpx
 
 from ballontranslator.modules.exceptions import (
     LLMAuthenticationError,
+    LLMBaseURLRequiredError,
     LLMOutputLimitError,
     LLMRequestStopped,
 )
 from ballontranslator.modules.llm_chat import (
     LLMChatRequester,
     LLMChatRequestError,
+    list_ollama_models,
     openai_chat_completion_args,
     openai_json_response_format,
 )
@@ -360,6 +362,57 @@ class LLMChatRequesterTest(unittest.TestCase):
 
         with self.assertRaises(LLMRequestStopped):
             self.requester._wait(5)
+
+
+class ListOllamaModelsTest(unittest.TestCase):
+    def test_list_ollama_models_requires_base_url(self) -> None:
+        with self.assertRaises(LLMBaseURLRequiredError):
+            list_ollama_models('')
+
+    def test_list_ollama_models_returns_sorted_unique_ids(self) -> None:
+        page = SimpleNamespace(data=[
+            SimpleNamespace(id='qwen2.5'),
+            SimpleNamespace(id='llama3.1'),
+            SimpleNamespace(id='qwen2.5'),
+            SimpleNamespace(id=' '),
+        ])
+        client = mock.MagicMock()
+        client.models.list.return_value = page
+        openai_module = SimpleNamespace(OpenAI=mock.Mock(return_value=client))
+        http_client = mock.MagicMock()
+
+        with (
+            mock.patch('httpx.Client', return_value=http_client) as client_ctor,
+            mock.patch.dict('sys.modules', {'openai': openai_module}),
+        ):
+            models = list_ollama_models('http://localhost:11434/v1/')
+
+        self.assertEqual(models, ['llama3.1', 'qwen2.5'])
+        client_ctor.assert_called_once_with(trust_env=False)
+        openai_module.OpenAI.assert_called_once()
+        self.assertEqual(
+            openai_module.OpenAI.call_args.kwargs['base_url'],
+            'http://localhost:11434/v1/',
+        )
+        client.close.assert_called_once()
+
+    def test_list_ollama_models_rejects_empty_catalog(self) -> None:
+        client = mock.MagicMock()
+        client.models.list.return_value = SimpleNamespace(data=[])
+        openai_module = SimpleNamespace(OpenAI=mock.Mock(return_value=client))
+
+        with (
+            mock.patch('httpx.Client', return_value=mock.MagicMock()),
+            mock.patch.dict('sys.modules', {'openai': openai_module}),
+            self.assertRaises(RuntimeError),
+        ):
+            list_ollama_models('http://localhost:11434/v1')
+
+    def test_list_ollama_models_honors_stop_event(self) -> None:
+        stop_event = threading.Event()
+        stop_event.set()
+        with self.assertRaises(LLMRequestStopped):
+            list_ollama_models('http://localhost:11434/v1', stop_event)
 
 
 if __name__ == '__main__':

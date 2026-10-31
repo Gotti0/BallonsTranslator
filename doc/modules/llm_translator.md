@@ -41,6 +41,11 @@ owns asynchronous GUI account operations; headless requests restore credentials
 on demand. Account changes and catalog refresh are independent, and signing in
 does not replay interrupted work.
 
+Ollama profiles expose an explicit Refresh control that loads installed model IDs
+from the OpenAI-compatible `/v1/models` endpoint and replaces text/vision
+`model_options`. Selection and settings construction still perform no network IO;
+only the user-triggered refresh talks to the local server.
+
 Codex credentials stay outside profile exports. Storage failures must preserve
 existing secrets, and rotated credentials must be saved before reuse.
 
