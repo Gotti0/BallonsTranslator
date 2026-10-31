@@ -640,6 +640,75 @@ def sync_codex_profile(profile: LLMProfile, models: Dict) -> None:
     profile.thinking_level_options = codex_thinking_options(profile, models)
 
 
+def _normalized_ollama_base_url(url: str) -> str:
+    return str(url or '').strip().rstrip('/')
+
+
+def is_ollama_profile(profile: Any) -> bool:
+    """Return whether a profile is the built-in Ollama entry or its default URL.
+
+    >>> is_ollama_profile(default_profile('Ollama'))
+    True
+    >>> is_ollama_profile(default_profile('LM Studio'))
+    False
+    """
+    if str(getattr(profile, 'id', '') or '') == 'ollama':
+        return True
+    ollama_url = _normalized_ollama_base_url(
+        PROVIDER_DEFAULTS['Ollama']['base_url']
+    ).lower()
+    base_url = _normalized_ollama_base_url(
+        getattr(profile, 'base_url', '')
+    ).lower()
+    return bool(base_url) and (
+        base_url == ollama_url or base_url.startswith(f'{ollama_url}/')
+    )
+
+
+def apply_ollama_model_catalog(
+    profile: LLMProfile,
+    models: Sequence[str],
+) -> bool:
+    """Replace text/vision options with an Ollama ``/v1/models`` catalog.
+
+    Preserves the current text and vision selections when they remain available;
+    otherwise falls back to the first catalog entry. Image settings are left
+    unchanged.
+
+    >>> profile = default_profile('Ollama')
+    >>> profile.model = 'llama3.1'
+    >>> apply_ollama_model_catalog(profile, ['qwen2.5', 'llama3.1'])
+    True
+    >>> profile.model_options
+    ['llama3.1', 'qwen2.5']
+    """
+    catalog: List[str] = []
+    for model in models:
+        name = str(model or '').strip()
+        if name and name not in catalog:
+            catalog.append(name)
+    catalog.sort()
+    changed = False
+    if list(profile.model_options) != catalog:
+        profile.model_options = list(catalog)
+        changed = True
+    if list(profile.vision_model_options) != catalog:
+        profile.vision_model_options = list(catalog)
+        changed = True
+    fallback = catalog[0] if catalog else ''
+    selected_model = str(profile.model or '').strip()
+    new_model = selected_model if selected_model in catalog else fallback
+    if profile.model != new_model:
+        profile.model = new_model
+        changed = True
+    selected_vision = str(profile.vision_model or '').strip()
+    new_vision = selected_vision if selected_vision in catalog else fallback
+    if profile.vision_model != new_vision:
+        profile.vision_model = new_vision
+        changed = True
+    return changed
+
+
 def runtime_profile(
     profiles: Sequence[Any],
     selected_profile_id: str,

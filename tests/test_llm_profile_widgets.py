@@ -12,7 +12,13 @@ from qtpy.QtWidgets import QApplication, QMenu, QVBoxLayout, QWidget
 from ballontranslator.ui.llm_profile_widgets import LLMProfilesWidget, ProfileCardWidget
 from ballontranslator.ui.misc import parse_stylesheet
 from ballontranslator.utils.config import pcfg
-from ballontranslator.utils.llm_profiles import default_codex_profile, LLMProfile, default_profile, profile_to_dict
+from ballontranslator.utils.llm_profiles import (
+    PROVIDER_DEFAULTS,
+    default_codex_profile,
+    LLMProfile,
+    default_profile,
+    profile_to_dict,
+)
 
 
 class LLMProfileModelSelectorTest(unittest.TestCase):
@@ -342,6 +348,53 @@ class APIProfilesPanelTest(unittest.TestCase):
             panel.copyProfile(codex.id)
             panel.deleteProfile(codex.id)
             self.assertEqual(pcfg.module.llm_profiles, [codex, api])
+
+
+class OllamaModelRefreshWidgetTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_refresh_button_visible_only_for_ollama_profiles(self) -> None:
+        ollama = default_profile('Ollama')
+        lmstudio = default_profile('LM Studio')
+        ollama_card = ProfileCardWidget(ollama)
+        lmstudio_card = ProfileCardWidget(lmstudio)
+        self.addCleanup(ollama_card.deleteLater)
+        self.addCleanup(lmstudio_card.deleteLater)
+        # Parents are not shown; use isHidden() for the local visibility flag.
+        self.assertFalse(ollama_card.refresh_models_btn.isHidden())
+        self.assertTrue(lmstudio_card.refresh_models_btn.isHidden())
+
+        lmstudio.base_url = PROVIDER_DEFAULTS['Ollama']['base_url']
+        lmstudio_card.refreshOllamaControls()
+        self.assertFalse(lmstudio_card.refresh_models_btn.isHidden())
+
+    def test_finish_refresh_applies_catalog_to_combos(self) -> None:
+        profile = default_profile('Ollama')
+        profile.model = 'llama3.1'
+        profile.vision_model = 'llama3.1'
+        card = ProfileCardWidget(profile)
+        self.addCleanup(card.deleteLater)
+
+        class FakeWorker:
+            stop_event = type('E', (), {'is_set': staticmethod(lambda: False)})()
+            models = ['phi3', 'llama3.1']
+            error = None
+
+            @staticmethod
+            def deleteLater() -> None:
+                return None
+
+        card._models_worker = FakeWorker()
+        card.finishOllamaModelsRefresh()
+        self.app.processEvents()
+
+        self.assertEqual(profile.model_options, ['llama3.1', 'phi3'])
+        self.assertEqual(profile.vision_model_options, ['llama3.1', 'phi3'])
+        self.assertEqual(card.model_combo.currentText(), 'llama3.1')
+        self.assertGreaterEqual(card.model_combo.findText('phi3'), 0)
+        self.assertIsNone(card._models_worker)
 
 
 if __name__ == '__main__':
